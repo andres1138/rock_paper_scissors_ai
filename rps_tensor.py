@@ -1,4 +1,4 @@
-# rps_tf_evolving_fixed.py
+# rps_tf_evolving_fixed.py  (patched)
 import os
 import traceback
 import random
@@ -6,7 +6,6 @@ import pickle
 from collections import deque, defaultdict, Counter
 from datetime import datetime
 from rps_plotter import RPSPlotter
-
 
 import numpy as np
 try:
@@ -20,7 +19,10 @@ except Exception:
 class RealTimeEvolvingRPS_TF:
     MOVES = ['rock', 'paper', 'scissors']
     IDX = {m: i for i, m in enumerate(MOVES)}
-    BEATS = {'rock': 'paper', 'paper': 'scissors', 'scissors': 'rock'}
+    # BEATS maps a move to the move it beats (canonical)
+    BEATS = {'rock': 'scissors', 'paper': 'rock', 'scissors': 'paper'}
+    # BEATEN_BY maps a move to the move that beats it (inverse of BEATS)
+    BEATEN_BY = {v: k for k, v in BEATS.items()}
 
     def __init__(self,
                 save_prefix="rps_beast2",
@@ -223,18 +225,24 @@ class RealTimeEvolvingRPS_TF:
             v[self.IDX[move]] = 1.0
         return v
 
+    def move_result(self, ai_move, opp_move):
+        """Return 'w' if AI wins, 'l' if AI loses, 'd' for draw."""
+        if ai_move == opp_move:
+            return 'd'
+        # If BEATS[ai_move] == opp_move, then ai_move beats opp_move.
+        if self.BEATS[ai_move] == opp_move:
+            return 'w'
+        return 'l'
+
     def _opponent_from_result(self, ai_move, result):
+        """
+        Reconstruct the opponent move given what the AI played and the result
+        (result is with respect to the AI: 'w' if AI won, 'l' if AI lost, 'd' draw).
+        """
         for m in self.MOVES:
-            if ai_move == m:
-                comp_result = 'd'
-            elif self.BEATS[m] == ai_move:
-                comp_result = 'w'
-            elif self.BEATS[ai_move] == m:
-                comp_result = 'l'
-            else:
-                comp_result = 'd'
-            if comp_result == result:
+            if self.move_result(ai_move, m) == result:
                 return m
+        # fallback (shouldn't happen)
         return random.choice(self.MOVES)
 
     # -----------------------------
@@ -352,7 +360,8 @@ class RealTimeEvolvingRPS_TF:
         idx = int(np.random.choice(self.K, p=probs))
         self.last_strategy_idx = idx
         predicted_opponent = self.strategy_predict(idx)
-        our_move = self.BEATS[predicted_opponent]
+        # pick the move that beats the predicted opponent move
+        our_move = self.BEATEN_BY[predicted_opponent]
         self.prediction_confidence = float(probs[idx])
         return our_move
 
@@ -361,9 +370,11 @@ class RealTimeEvolvingRPS_TF:
     # -----------------------------
     def update(self, ai_move, result):
         if result not in ('w', 'l', 'd'):
-            raise ValueError("result must be 'w','l' or 'd'")
+            raise ValueError("result must be 'w','l' or 'd' (from AI's perspective)")
 
+        # reconstruct actual opponent move (result is relative to the AI)
         opponent_move = self._opponent_from_result(ai_move, result)
+
         self.opponent_history.append(opponent_move)
         self.ai_history.append(ai_move)
         self.results.append(result)
@@ -402,6 +413,7 @@ class RealTimeEvolvingRPS_TF:
 
         if self.last_strategy_idx is not None:
             pred = self.strategy_predict(self.last_strategy_idx)
+            # reward is whether that strategy predicted the opponent correctly
             reward = 1.0 if pred == opponent_move else 0.0
             W = np.array(self.weights, dtype=float)
             if W.sum() == 0:
@@ -459,7 +471,8 @@ def main(save_prefix="rps_beast"):
     ai = RealTimeEvolvingRPS_TF(save_prefix)
     plotter = RPSPlotter(ai)
     print("🎮 Evolving RPS AI + TensorFlow Ready!")
-    print("AI suggests moves. Report result as 'w','l','d'. Commands: stats, reset, save, exit\n")
+    print("AI suggests moves. **IMPORTANT:** report results from the AI's perspective:")
+    print("  type 'w' if the AI WON, 'l' if the AI LOST, 'd' for draw. Commands: stats, reset, save, exit\n")
     while True:
         try:
             ai_move = ai.get_move()
@@ -496,9 +509,8 @@ def main(save_prefix="rps_beast"):
             ai.update(ai_move, result)
         except Exception as e:
             print("⚠️ update error:", e)
-            
+
         plotter.update_plot()
 
 if __name__ == "__main__":
     main()
-
