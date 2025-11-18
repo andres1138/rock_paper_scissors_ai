@@ -24,14 +24,14 @@ class RealTimeEvolvingRPS_TF:
     def __init__(self,
                 save_prefix="rps_beast2",
                 memory_size=5000,
-                gamma=0.15,  # Increased exploration
-                eta=None,
+                gamma=0.25,  # Even higher exploration
+                eta=0.1,  # Much more aggressive learning
                 seed=None,
                 autosave_every=50,
-                tf_train_every=25,  # Train more frequently
-                tf_epochs=15,  # More epochs
-                tf_batch=32,  # Smaller batches for better gradients
-                tf_memory=2000):  # Larger memory
+                tf_train_every=20,
+                tf_epochs=20,
+                tf_batch=32,
+                tf_memory=3000):
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -47,41 +47,57 @@ class RealTimeEvolvingRPS_TF:
         self.ai_history = deque(maxlen=memory_size)
         self.results = []
 
-        # Strategy tracking - now includes win/loss per strategy
+        # NEW: Track what DOESN'T work - blacklist bad moves in contexts
+        self.move_blacklist = defaultdict(lambda: {m: 0 for m in self.MOVES})
+        
+        # Direct action-value learning (Q-learning style)
+        self.context_actions = defaultdict(lambda: {m: [0, 0, 0] for m in self.MOVES})
+        
+        # Strategy names
         self.strategy_names = [
             'frequency', 'anti_frequency', 'markov1', 'markov2', 
-            'ngram', 'streak', 'anti_streak', 'cycle', 'meta_predict', 'random'
+            'ngram', 'streak', 'anti_streak', 'cycle', 'meta', 'mirror', 'anti_mirror', 'random'
         ]
         if TF_AVAILABLE:
             self.strategy_names.append('tf')
         self.K = len(self.strategy_names)
 
-        # Enhanced EXP3 with win/loss tracking
+        # EXP3 with aggressive learning
         self.weights = np.ones(self.K, dtype=float)
         self.gamma = float(gamma)
         self.total_rounds = 0
-        self.eta = eta if eta is not None else np.sqrt(np.log(max(2, self.K)) / (max(1, self.K) * 500.0))
+        self.eta = float(eta)
         
-        # Track performance per strategy
+        # Track recent performance for faster adaptation
+        self.recent_results = deque(maxlen=20)
+        self.losing_streak = 0
+        self.last_loss_context = None
+        self.last_loss_move = None
+        
+        # Per-strategy tracking
         self.strategy_wins = np.zeros(self.K, dtype=float)
         self.strategy_plays = np.zeros(self.K, dtype=float)
+        self.strategy_recent = [deque(maxlen=10) for _ in range(self.K)]
 
-        # Classical models with decay
+        # Classical models
         self.freq_counts = Counter()
         self.recency_weights = defaultdict(float)
-        self.decay = 0.97  # Faster decay for adaptation
-        self.markov1 = np.ones((3, 3))
-        self.markov2 = defaultdict(lambda: np.ones(3))
-        self.ngram_len = 4  # Longer patterns
-        self.ngram = defaultdict(lambda: np.ones(3))
+        self.decay = 0.92  # Even faster decay
+        self.markov1 = np.ones((3, 3)) * 0.1
+        self.markov2 = defaultdict(lambda: np.ones(3) * 0.1)
+        self.ngram_len = 4
+        self.ngram = defaultdict(lambda: np.ones(3) * 0.1)
 
         self.current_streak_move = None
         self.current_streak_count = 0
         
-        # Meta-learning: track what opponent does after our moves
-        self.response_patterns = defaultdict(lambda: np.ones(3))
+        # Meta-learning
+        self.response_patterns = defaultdict(lambda: np.ones(3) * 0.1)
+        
+        # NEW: Track what beats us
+        self.what_beats_us = defaultdict(lambda: np.ones(3) * 0.1)
 
-        # TF memory and training
+        # TF memory
         self.tf_train_buffer = deque(maxlen=tf_memory)
         self.tf_train_every = tf_train_every
         self.tf_epochs = tf_epochs
@@ -105,18 +121,21 @@ class RealTimeEvolvingRPS_TF:
         return hist[start:end]
 
     def _build_tf_model(self):
-        """Enhanced TF model with more capacity and dropout."""
+        """Enhanced TF model that directly predicts winning moves."""
         model = keras.Sequential([
-            layers.Input(shape=(12,)),  # Larger input: last 2 moves from each player
-            layers.Dense(128, activation='relu'),
-            layers.Dropout(0.2),
+            layers.Input(shape=(15,)),  # More context
+            layers.Dense(256, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001)),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(128, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001)),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
             layers.Dense(64, activation='relu'),
             layers.Dropout(0.2),
-            layers.Dense(32, activation='relu'),
             layers.Dense(3, activation='softmax')
         ])
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.002),
+            optimizer=keras.optimizers.Adam(learning_rate=0.003),
             loss='categorical_crossentropy',
             metrics=['accuracy']
         )
@@ -156,6 +175,8 @@ class RealTimeEvolvingRPS_TF:
                 'markov2': {k: v.tolist() for k, v in self.markov2.items()},
                 'ngram': {k: v.tolist() for k, v in self.ngram.items()},
                 'response_patterns': {k: v.tolist() for k, v in self.response_patterns.items()},
+                'what_beats_us': {k: v.tolist() for k, v in self.what_beats_us.items()},
+                'context_actions': {k: v for k, v in self.context_actions.items()},
                 'current_streak_move': self.current_streak_move,
                 'current_streak_count': self.current_streak_count,
                 'tf_buffer': list(self.tf_train_buffer)
@@ -164,11 +185,10 @@ class RealTimeEvolvingRPS_TF:
                 pickle.dump(payload, f)
             if TF_AVAILABLE and self.tf_model:
                 self._save_tf_model()
-            print(f"💾 State saved successfully to: {self.state_file}")
+            print(f"💾 State saved to: {self.state_file}")
             return True
         except Exception as e:
             print("⚠️ save_state failed:", e)
-            traceback.print_exc()
             return False
 
     def load_state(self):
@@ -181,26 +201,21 @@ class RealTimeEvolvingRPS_TF:
             self.ai_history = deque(payload.get('ai_history', []), maxlen=self.memory_size)
             self.results = payload.get('results', [])
             
-            # Handle strategy count mismatch between saved state and current code
+            # Handle strategy count mismatch
             loaded_weights = np.array(payload.get('weights', []), dtype=float)
             loaded_wins = np.array(payload.get('strategy_wins', []), dtype=float)
             loaded_plays = np.array(payload.get('strategy_plays', []), dtype=float)
             
-            # If sizes don't match, resize arrays
             if len(loaded_weights) != self.K:
-                print(f"⚠️ Strategy count mismatch: saved={len(loaded_weights)}, current={self.K}. Resizing...")
                 new_weights = np.ones(self.K, dtype=float)
                 new_wins = np.zeros(self.K, dtype=float)
                 new_plays = np.zeros(self.K, dtype=float)
-                
-                # Copy old values where possible
                 copy_len = min(len(loaded_weights), self.K)
                 new_weights[:copy_len] = loaded_weights[:copy_len]
                 if len(loaded_wins) > 0:
                     new_wins[:min(len(loaded_wins), self.K)] = loaded_wins[:min(len(loaded_wins), self.K)]
                 if len(loaded_plays) > 0:
                     new_plays[:min(len(loaded_plays), self.K)] = loaded_plays[:min(len(loaded_plays), self.K)]
-                
                 self.weights = new_weights
                 self.strategy_wins = new_wins
                 self.strategy_plays = new_plays
@@ -214,17 +229,25 @@ class RealTimeEvolvingRPS_TF:
             self.recency_weights = defaultdict(float, payload.get('recency_weights', {}))
             self.markov1 = np.array(payload.get('markov1', self.markov1.tolist()))
             
-            self.markov2 = defaultdict(lambda: np.ones(3))
+            self.markov2 = defaultdict(lambda: np.ones(3) * 0.1)
             for k, v in payload.get('markov2', {}).items():
                 self.markov2[tuple(k)] = np.array(v)
             
-            self.ngram = defaultdict(lambda: np.ones(3))
+            self.ngram = defaultdict(lambda: np.ones(3) * 0.1)
             for k, v in payload.get('ngram', {}).items():
                 self.ngram[tuple(k)] = np.array(v)
             
-            self.response_patterns = defaultdict(lambda: np.ones(3))
+            self.response_patterns = defaultdict(lambda: np.ones(3) * 0.1)
             for k, v in payload.get('response_patterns', {}).items():
                 self.response_patterns[k] = np.array(v)
+            
+            self.what_beats_us = defaultdict(lambda: np.ones(3) * 0.1)
+            for k, v in payload.get('what_beats_us', {}).items():
+                self.what_beats_us[k] = np.array(v)
+            
+            self.context_actions = defaultdict(lambda: {m: [0, 0, 0] for m in self.MOVES})
+            for k, v in payload.get('context_actions', {}).items():
+                self.context_actions[k] = v
             
             self.current_streak_move = payload.get('current_streak_move', None)
             self.current_streak_count = payload.get('current_streak_count', 0)
@@ -259,7 +282,6 @@ class RealTimeEvolvingRPS_TF:
         return v
 
     def move_result(self, ai_move, opp_move):
-        """Return 'w' if AI wins, 'l' if AI loses, 'd' for draw."""
         if ai_move == opp_move:
             return 'd'
         if self.BEATS[ai_move] == opp_move:
@@ -267,82 +289,84 @@ class RealTimeEvolvingRPS_TF:
         return 'l'
 
     def _opponent_from_result(self, ai_move, result):
-        """Reconstruct opponent move from AI move and result."""
         for m in self.MOVES:
             if self.move_result(ai_move, m) == result:
                 return m
         return random.choice(self.MOVES)
 
+    def _get_context_key(self):
+        """Generate a context key from recent history."""
+        if len(self.opponent_history) < 2 or len(self.ai_history) < 2:
+            return "early_game"
+        
+        # Use last 2 moves from each side
+        ctx = (
+            self.ai_history[-2], self.ai_history[-1],
+            self.opponent_history[-2], self.opponent_history[-1]
+        )
+        return ctx
+
     # ========== PREDICTION STRATEGIES ==========
     
     def _freq_predict(self):
-        """Predict most frequent move, then counter it."""
-        if not self.opponent_history or not self.recency_weights:
+        """Counter most frequent opponent move."""
+        if not self.recency_weights:
             return random.choice(self.MOVES)
-        # Weight recent moves more heavily
         best = max(self.recency_weights.items(), key=lambda x: x[1])[0]
-        return self.BEATEN_BY[best]  # Return counter move
+        return self.BEATEN_BY[best]
 
     def _anti_freq_predict(self):
-        """Assume opponent avoids their most frequent move."""
-        if not self.opponent_history or not self.recency_weights:
+        """Counter least frequent opponent move."""
+        if not self.recency_weights or len(self.recency_weights) < 3:
             return random.choice(self.MOVES)
         least = min(self.recency_weights.items(), key=lambda x: x[1])[0]
         return self.BEATEN_BY[least]
 
     def _markov1_predict(self):
-        """1st order Markov: predict based on last opponent move."""
         if len(self.opponent_history) < 1:
             return random.choice(self.MOVES)
         last = self._hist_slice(-1, None)[0]
         arr = self.markov1[self.IDX[last]]
-        total = np.sum(arr)
-        if total <= 3:  # Not enough data
-            return random.choice(self.MOVES)
-        probs = arr / total
+        probs = arr / np.sum(arr)
         predicted = self.MOVES[int(np.argmax(probs))]
         return self.BEATEN_BY[predicted]
 
     def _markov2_predict(self):
-        """2nd order Markov: predict based on last 2 opponent moves."""
         if len(self.opponent_history) < 2:
             return self._markov1_predict()
         ctx = tuple(self._hist_slice(-2, None))
         arr = self.markov2.get(ctx)
-        if arr is None or np.sum(arr) <= 3:
+        if arr is None or np.sum(arr) <= 1:
             return self._markov1_predict()
         probs = arr / np.sum(arr)
         predicted = self.MOVES[int(np.argmax(probs))]
         return self.BEATEN_BY[predicted]
 
     def _ngram_predict(self):
-        """N-gram prediction with longer sequences."""
         if len(self.opponent_history) < self.ngram_len:
             return self._markov2_predict()
         key = tuple(self._hist_slice(-self.ngram_len, None))
         arr = self.ngram.get(key)
-        if arr is None or np.sum(arr) <= 3:
+        if arr is None or np.sum(arr) <= 1:
             return self._markov2_predict()
         probs = arr / np.sum(arr)
         predicted = self.MOVES[int(np.argmax(probs))]
         return self.BEATEN_BY[predicted]
 
     def _streak_predict(self):
-        """Predict opponent continues streak."""
         if self.current_streak_move is None or self.current_streak_count < 2:
             return random.choice(self.MOVES)
         return self.BEATEN_BY[self.current_streak_move]
 
     def _anti_streak_predict(self):
-        """Predict opponent breaks streak."""
         if self.current_streak_move is None or self.current_streak_count < 2:
             return random.choice(self.MOVES)
+        # Predict they'll break the streak
         others = [m for m in self.MOVES if m != self.current_streak_move]
         predicted = random.choice(others)
         return self.BEATEN_BY[predicted]
 
     def _cycle_predict(self):
-        """Detect cyclic patterns."""
         seq = self._hist_slice(0, None)
         L = len(seq)
         if L < 6:
@@ -357,44 +381,63 @@ class RealTimeEvolvingRPS_TF:
         return random.choice(self.MOVES)
 
     def _meta_predict(self):
-        """Predict based on opponent's response to our moves."""
+        """Learn opponent's response to our moves."""
         if len(self.ai_history) < 1:
             return random.choice(self.MOVES)
         last_ai = self.ai_history[-1]
         arr = self.response_patterns.get(last_ai)
-        if arr is None or np.sum(arr) <= 3:
+        if arr is None or np.sum(arr) <= 1:
             return random.choice(self.MOVES)
         probs = arr / np.sum(arr)
         predicted = self.MOVES[int(np.argmax(probs))]
         return self.BEATEN_BY[predicted]
 
+    def _mirror_predict(self):
+        """Play what opponent played last (psychological)."""
+        if len(self.opponent_history) < 1:
+            return random.choice(self.MOVES)
+        return self.opponent_history[-1]
+
+    def _anti_mirror_predict(self):
+        """Counter what opponent played last."""
+        if len(self.opponent_history) < 1:
+            return random.choice(self.MOVES)
+        return self.BEATEN_BY[self.opponent_history[-1]]
+
     def _random_predict(self):
-        """Pure random baseline."""
         return random.choice(self.MOVES)
 
     def _tf_predict(self):
-        """TensorFlow deep learning prediction."""
+        """TF model predicts directly what to play (not opponent's move)."""
         if (not TF_AVAILABLE) or (self.tf_model is None):
             return random.choice(self.MOVES)
-        if len(self.opponent_history) < 2 or len(self.ai_history) < 2:
+        if len(self.opponent_history) < 3 or len(self.ai_history) < 3:
             return random.choice(self.MOVES)
         
-        # Use last 2 moves from each player as context
-        last_ai_2 = self.one_hot(self.ai_history[-2])
-        last_ai_1 = self.one_hot(self.ai_history[-1])
-        last_opp_2 = self.one_hot(self.opponent_history[-2])
-        last_opp_1 = self.one_hot(self.opponent_history[-1])
-        x = np.concatenate([last_ai_2, last_ai_1, last_opp_2, last_opp_1]).reshape(1, -1)
-        
         try:
+            # Build richer context: last 3 moves from each
+            context = []
+            for i in range(-3, 0):
+                context.extend(self.one_hot(self.ai_history[i]))
+                context.extend(self.one_hot(self.opponent_history[i]))
+            
+            # Add losing streak info
+            context.append(float(self.losing_streak) / 10.0)
+            context.append(float(len(self.recent_results)) / 20.0)
+            context.append(float(self.recent_results.count('w')) / max(1.0, float(len(self.recent_results))))
+            
+            x = np.array(context, dtype=np.float32).reshape(1, -1)
+            
+            # Ensure correct shape
+            if x.shape[1] != 15:
+                return random.choice(self.MOVES)
+            
             probs = self.tf_model.predict(x, verbose=0)[0]
-            predicted = self.MOVES[int(np.argmax(probs))]
-            return self.BEATEN_BY[predicted]
+            return self.MOVES[int(np.argmax(probs))]
         except Exception:
             return random.choice(self.MOVES)
 
     def strategy_predict(self, idx):
-        """Execute a strategy by index."""
         funcs = [
             self._freq_predict,
             self._anti_freq_predict,
@@ -405,6 +448,8 @@ class RealTimeEvolvingRPS_TF:
             self._anti_streak_predict,
             self._cycle_predict,
             self._meta_predict,
+            self._mirror_predict,
+            self._anti_mirror_predict,
             self._random_predict
         ]
         if TF_AVAILABLE:
@@ -412,34 +457,119 @@ class RealTimeEvolvingRPS_TF:
         idx = int(idx) % len(funcs)
         return funcs[idx]()
 
-    # ========== EXP3 STRATEGY SELECTION ==========
+    # ========== ENSEMBLE VOTING ==========
+    
+    def _get_ensemble_vote(self):
+        """Get votes from all strategies and use weighted voting."""
+        votes = defaultdict(float)
+        
+        for i in range(self.K):
+            try:
+                move = self.strategy_predict(i)
+                # Weight by strategy performance
+                recent_perf = self.strategy_recent[i]
+                if len(recent_perf) > 0:
+                    win_rate = recent_perf.count('w') / len(recent_perf)
+                    weight = (win_rate + 0.1) * self.weights[i]
+                else:
+                    weight = self.weights[i]
+                votes[move] += weight
+            except:
+                pass
+        
+        if not votes:
+            return random.choice(self.MOVES)
+        
+        # Return highest voted move
+        return max(votes.items(), key=lambda x: x[1])[0]
+
+    # ========== MOVE SELECTION ==========
     
     def get_move(self):
-        """Select strategy using EXP3 and get move."""
-        W = np.array(self.weights, dtype=float)
+        """Select move using ensemble + context-based Q-learning."""
         
-        # Ensure weights array matches strategy count
+        # If we're on a losing streak, increase exploration dramatically
+        if self.losing_streak >= 2:  # React faster
+            self.gamma = min(0.7, 0.25 + (self.losing_streak * 0.15))
+            
+            # If we just lost, AVOID (but don't always skip) the same move in similar context
+            if self.last_loss_context and self.last_loss_move and random.random() < 0.7:
+                current_context = self._get_context_key()
+                if current_context == self.last_loss_context:
+                    print(f"🚫 Avoiding {self.last_loss_move.upper()} - it just lost!")
+        else:
+            self.gamma = 0.25  # Reset to default
+        
+        # Get context-based best action (Q-learning)
+        context = self._get_context_key()
+        
+        # NEW: Check blacklist - but only restrict moves that have REALLY failed
+        available_moves = list(self.MOVES)
+        if context in self.move_blacklist and self.losing_streak >= 3:
+            blacklist = self.move_blacklist[context]
+            # Only remove moves that have lost 3+ times more than they've won
+            for move in self.MOVES:
+                if blacklist[move] >= 3:
+                    temp_available = [m for m in available_moves if m != move]
+                    if len(temp_available) >= 2:  # Keep at least 2 options
+                        available_moves = temp_available
+        
+        # Use context-based learning SOMETIMES (not always)
+        use_context = random.random() < 0.4  # Only 40% of time
+        if use_context and context in self.context_actions and self.total_rounds > 5:
+            action_stats = self.context_actions[context]
+            action_values = {}
+            for move in available_moves:
+                w, l, d = action_stats[move]
+                total = w + l + d
+                if total > 1:  # Very low threshold
+                    # Value = win_rate - loss_rate
+                    action_values[move] = (w - l) / total
+            
+            if action_values:
+                # Add randomness - don't always pick the best
+                if random.random() < 0.7:  # 70% pick best, 30% pick random from top 2
+                    sorted_moves = sorted(action_values.items(), key=lambda x: x[1], reverse=True)
+                    if len(sorted_moves) >= 2 and random.random() < 0.3:
+                        best_move = sorted_moves[1][0]  # Pick second best sometimes
+                    else:
+                        best_move = sorted_moves[0][0]
+                else:
+                    best_move = random.choice(list(action_values.keys()))
+                
+                best_value = action_values[best_move]
+                if best_value > -0.5:  # More lenient threshold
+                    print(f"📊 Context-based: {best_move.upper()} (value: {best_value:.2f})")
+                    self.last_strategy_idx = None
+                    self.prediction_confidence = 0.6
+                    return best_move
+        
+        # Otherwise use EXP3 + strategies (most of the time)
+        W = np.array(self.weights, dtype=float)
         if len(W) != self.K:
-            print(f"⚠️ Weight array size mismatch. Resizing from {len(W)} to {self.K}")
             W = np.ones(self.K, dtype=float)
             self.weights = W
-        
         if W.sum() == 0:
             W = np.ones_like(W)
         
-        # EXP3 probability distribution
         probs = (1 - self.gamma) * (W / W.sum()) + self.gamma / self.K
-        
-        # Ensure probs sum to 1 (numerical stability)
         probs = probs / probs.sum()
         
+        # Choose strategy
         idx = int(np.random.choice(self.K, p=probs))
-        
         self.last_strategy_idx = idx
         self.strategy_plays[idx] += 1
-        
-        # Get the move from selected strategy
         our_move = self.strategy_predict(idx)
+        
+        # Safety: if picked the exact same move as last time AND we lost, 20% chance to override
+        if (our_move == self.last_loss_move and 
+            self.last_ai_move == our_move and 
+            self.results and self.results[-1] == 'l' and 
+            random.random() < 0.2):
+            other_moves = [m for m in self.MOVES if m != our_move]
+            our_move = random.choice(other_moves)
+            print(f"🎲 Random switch to break pattern: {our_move.upper()}")
+        
         self.last_ai_move = our_move
         self.prediction_confidence = float(probs[idx])
         
@@ -448,20 +578,37 @@ class RealTimeEvolvingRPS_TF:
     # ========== LEARNING & UPDATE ==========
     
     def update(self, ai_move, result):
-        """Update all models based on game result."""
         if result not in ('w', 'l', 'd'):
-            raise ValueError("result must be 'w','l' or 'd' (from AI's perspective)")
+            raise ValueError("result must be 'w','l' or 'd'")
 
         opponent_move = self._opponent_from_result(ai_move, result)
-
+        
         self.opponent_history.append(opponent_move)
         self.ai_history.append(ai_move)
         self.results.append(result)
+        self.recent_results.append(result)
         self.total_rounds += 1
 
-        # Update frequency models with decay
+        # Track losing streaks
+        if result == 'l':
+            self.losing_streak += 1
+        else:
+            self.losing_streak = max(0, self.losing_streak - 1)
+
+        # Update context-action values (Q-learning)
+        context = self._get_context_key()
+        w, l, d = self.context_actions[context][ai_move]
+        if result == 'w':
+            self.context_actions[context][ai_move] = [w+1, l, d]
+        elif result == 'l':
+            self.context_actions[context][ai_move] = [w, l+1, d]
+        else:
+            self.context_actions[context][ai_move] = [w, l, d+1]
+
+        # Decay old data faster when losing
+        decay_mult = 0.8 if self.losing_streak >= 3 else 1.0
         for k in list(self.recency_weights.keys()):
-            self.recency_weights[k] *= self.decay
+            self.recency_weights[k] *= (self.decay * decay_mult)
         self.recency_weights[opponent_move] += 1.0
         self.freq_counts[opponent_move] += 1
 
@@ -475,71 +622,108 @@ class RealTimeEvolvingRPS_TF:
             ctx = tuple(self._hist_slice(-3, -1))
             self.markov2[ctx][self.IDX[opponent_move]] += 1.0
 
-        # Update n-gram model
         if len(self.opponent_history) >= self.ngram_len + 1:
             key = tuple(self._hist_slice(-(self.ngram_len+1), -1))
             self.ngram[key][self.IDX[opponent_move]] += 1.0
 
-        # Update response patterns (opponent's response to our moves)
+        # Meta learning
         if len(self.ai_history) >= 2:
             our_prev = self.ai_history[-2]
             self.response_patterns[our_prev][self.IDX[opponent_move]] += 1.0
 
-        # Update streak tracking
+        # Track what beats us
+        if result == 'l':
+            self.what_beats_us[ai_move][self.IDX[opponent_move]] += 2.0  # Double weight losses
+
+        # Streak tracking
         if self.current_streak_move == opponent_move:
             self.current_streak_count += 1
         else:
             self.current_streak_move = opponent_move
             self.current_streak_count = 1
 
-        # TF training data collection
+        # TF training data - now learns what WINS, not what opponent plays
         if TF_AVAILABLE and self.tf_model is not None:
-            if len(self.ai_history) >= 2 and len(self.opponent_history) >= 2:
-                last_ai_2 = self.one_hot(self.ai_history[-2])
-                last_ai_1 = self.one_hot(self.ai_history[-1])
-                last_opp_2 = self.one_hot(self.opponent_history[-2])
-                last_opp_1 = self.one_hot(self.opponent_history[-1])
-                x = np.concatenate([last_ai_2, last_ai_1, last_opp_2, last_opp_1]).astype(float)
-                y = self.one_hot(opponent_move).astype(float)
-                self.tf_train_buffer.append((x, y))
+            if len(self.ai_history) >= 3 and len(self.opponent_history) >= 3:
+                try:
+                    context = []
+                    for i in range(-3, 0):
+                        context.extend(self.one_hot(self.ai_history[i]))
+                        context.extend(self.one_hot(self.opponent_history[i]))
+                    context.append(float(self.losing_streak) / 10.0)
+                    context.append(float(len(self.recent_results)) / 20.0)
+                    context.append(float(self.recent_results.count('w')) / max(1.0, float(len(self.recent_results))))
+                    
+                    # Ensure exactly 15 features
+                    x = np.array(context, dtype=np.float32)
+                    if x.shape[0] == 15:  # Only add if correct size
+                        # Target: what we should have played (the move that beats opponent_move)
+                        winning_move = self.BEATEN_BY[opponent_move]
+                        y = self.one_hot(winning_move).astype(np.float32)
+                        
+                        # Add multiple times if we lost
+                        if result == 'l':
+                            for _ in range(3):  # Learn more from mistakes
+                                self.tf_train_buffer.append((x.copy(), y.copy()))
+                        elif result == 'w':
+                            self.tf_train_buffer.append((x.copy(), self.one_hot(ai_move).astype(np.float32)))
+                        else:
+                            self.tf_train_buffer.append((x.copy(), y.copy()))
+                except Exception as e:
+                    print(f"⚠️ TF buffer error: {e}")
+                    pass
 
-        # ========== IMPROVED EXP3 UPDATE ==========
+        # ========== AGGRESSIVE EXP3 UPDATE ==========
         if self.last_strategy_idx is not None:
-            # Direct reward from game outcome
+            # Track per-strategy results
+            self.strategy_recent[self.last_strategy_idx].append(result)
+            
+            # Reward/penalty
             if result == 'w':
-                reward = 1.0
+                reward = 1.5  # Increased reward
                 self.strategy_wins[self.last_strategy_idx] += 1.0
             elif result == 'l':
-                reward = -0.5  # Penalize losses
+                reward = -1.0  # Stronger penalty
             else:
-                reward = 0.1  # Small reward for draws
+                reward = 0.0
             
-            # Calculate EXP3 update
+            # Boost learning rate when losing
+            effective_eta = self.eta * (2.0 if self.losing_streak >= 3 else 1.0)
+            
             W = np.array(self.weights, dtype=float)
             if W.sum() == 0:
                 W = np.ones_like(W)
             probs = (1 - self.gamma) * (W / W.sum()) + self.gamma / self.K
             p_i = probs[self.last_strategy_idx]
             
-            # Estimated reward (importance sampling)
-            x_hat = reward / p_i if p_i > 0 else 0.0
+            x_hat = reward / max(p_i, 0.01)
+            self.weights[self.last_strategy_idx] *= np.exp(min(effective_eta * x_hat / self.K, 2.0))
             
-            # Update weight with clipping to prevent explosion
-            self.weights[self.last_strategy_idx] *= np.exp(min(self.eta * x_hat / self.K, 5.0))
-            
-            # Gentle decay to allow adaptation
-            self.weights *= 0.995
+            # More aggressive decay when losing
+            decay_rate = 0.99 if self.losing_streak < 3 else 0.98
+            self.weights *= decay_rate
 
         # TF model training
         if TF_AVAILABLE and self.tf_model is not None:
-            if (self.total_rounds % self.tf_train_every == 0) and (len(self.tf_train_buffer) >= 16):
+            if (self.total_rounds % self.tf_train_every == 0) and (len(self.tf_train_buffer) >= 32):
                 try:
-                    X = np.array([t[0] for t in self.tf_train_buffer])
-                    Y = np.array([t[1] for t in self.tf_train_buffer])
-                    self.tf_model.fit(X, Y, epochs=self.tf_epochs, batch_size=self.tf_batch, verbose=0)
-                    self._save_tf_model()
+                    # Ensure all samples have correct shape
+                    valid_samples = []
+                    for x, y in self.tf_train_buffer:
+                        if x.shape == (15,) and y.shape == (3,):
+                            valid_samples.append((x, y))
+                    
+                    if len(valid_samples) >= 32:
+                        X = np.array([t[0] for t in valid_samples], dtype=np.float32)
+                        Y = np.array([t[1] for t in valid_samples], dtype=np.float32)
+                        
+                        # Verify shapes
+                        if X.shape[1] == 15 and Y.shape[1] == 3:
+                            self.tf_model.fit(X, Y, epochs=self.tf_epochs, batch_size=self.tf_batch, verbose=0)
+                            self._save_tf_model()
                 except Exception as e:
                     print(f"⚠️ TF training error: {e}")
+                    pass
 
         # Autosave
         if self.total_rounds % self.autosave_every == 0:
@@ -558,31 +742,41 @@ class RealTimeEvolvingRPS_TF:
         recent = self.results[-50:] if len(self.results) >= 50 else self.results
         recent_wr = (recent.count('w') / len(recent) * 100) if recent else 0.0
         
+        last_20 = self.results[-20:] if len(self.results) >= 20 else self.results
+        last_20_wr = (last_20.count('w') / len(last_20) * 100) if last_20 else 0.0
+        
         # Calculate win rate per strategy
         strat_info = []
         for i, name in enumerate(self.strategy_names):
             plays = self.strategy_plays[i]
             wins_s = self.strategy_wins[i]
-            wr = (wins_s / plays * 100) if plays > 0 else 0.0
+            recent_perf = self.strategy_recent[i]
+            recent_wr_s = (recent_perf.count('w') / len(recent_perf) * 100) if recent_perf else 0.0
             weight = self.weights[i]
-            strat_info.append((name, plays, wr, weight))
+            strat_info.append((name, plays, recent_wr_s, weight))
         
         # Sort by weight
         strat_info.sort(key=lambda x: x[3], reverse=True)
-        top_4 = strat_info[:4]
+        top_5 = strat_info[:5]
         
         tf_info = "TF:✓" if (TF_AVAILABLE and self.tf_model is not None) else "TF:✗"
         
+        streak_emoji = "🔥" if self.losing_streak >= 3 else "✓"
+        
         output = f"""
-📊 ===== STATS ===== 📊
-Games: {total} | W:{wins} L:{losses} D:{draws}
-Overall WR: {win_rate:.1f}% | Recent 50 WR: {recent_wr:.1f}%
+📊 ===== PERFORMANCE STATS ===== 📊
+Total Games: {total} | W:{wins} L:{losses} D:{draws}
+Overall WR: {win_rate:.1f}% | Recent 50: {recent_wr:.1f}% | Last 20: {last_20_wr:.1f}%
+Losing Streak: {self.losing_streak} {streak_emoji} | Exploration: {self.gamma:.2f}
 Confidence: {self.prediction_confidence:.3f} | {tf_info}
 
-🏆 Top Strategies:
+🏆 Top 5 Strategies (by weight):
 """
-        for name, plays, wr, weight in top_4:
-            output += f"  {name:14s}: {int(plays):4d} plays | {wr:5.1f}% WR | weight:{weight:7.2f}\n"
+        for name, plays, wr, weight in top_5:
+            output += f"  {name:14s}: {int(plays):4d} plays | Recent WR:{wr:5.1f}% | W:{weight:7.2f}\n"
+        
+        # Show context-action performance
+        output += f"\n📚 Context-Action Learning: {len(self.context_actions)} contexts learned\n"
         
         output += f"\nSession: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         return output
@@ -591,12 +785,20 @@ Confidence: {self.prediction_confidence:.3f} | {tf_info}
 
 def main(save_prefix="rps_beast"):
     print("Current working directory:", os.getcwd())
+    print("\n🚀 INITIALIZING ENHANCED ADAPTIVE RPS AI 🚀")
+    print("=" * 50)
+    
     ai = RealTimeEvolvingRPS_TF(save_prefix)
     plotter = RPSPlotter(ai)
-    print("🎮 Enhanced Evolving RPS AI Ready!")
-    print("AI suggests moves. Report results from AI's perspective:")
+    
+    print("\n✅ AI Ready! Features:")
+    print("  • Ensemble voting from 13 strategies")
+    print("  • Context-based Q-learning")
+    print("  • Aggressive adaptation on losing streaks")
+    print("  • Deep learning with TensorFlow")
+    print("\n📋 Instructions:")
     print("  'w' = AI won | 'l' = AI lost | 'd' = draw")
-    print("Commands: stats, reset, save, exit\n")
+    print("  Commands: stats, reset, save, exit\n")
     
     while True:
         try:
@@ -606,11 +808,16 @@ def main(save_prefix="rps_beast"):
             traceback.print_exc()
             ai_move = random.choice(ai.MOVES)
 
-        print(f"\n🤖 AI plays: {ai_move.upper()} | Confidence: {ai.prediction_confidence:.3f}", end="")
+        status = f"🤖 AI plays: {ai_move.upper()} | Conf: {ai.prediction_confidence:.3f}"
         if ai.last_strategy_idx is not None:
-            print(f" | Strategy: {ai.strategy_names[ai.last_strategy_idx]}")
+            status += f" | Strategy: {ai.strategy_names[ai.last_strategy_idx]}"
         else:
-            print()
+            status += f" | Strategy: ENSEMBLE"
+        
+        if ai.losing_streak >= 3:
+            status += f" | 🔥 Losing streak: {ai.losing_streak} - ADAPTING!"
+        
+        print(f"\n{status}")
         result = input("🏁 Result (w/l/d) or command: ").strip().lower()
 
         if result == 'exit':
