@@ -74,6 +74,13 @@ class RealTimeEvolvingRPS_TF:
         self.last_loss_context = None
         self.last_loss_move = None
         
+        # NEW: Pattern detection and randomness detection
+        self.pattern_confidence = 0.0
+        self.randomness_score = 0.5  # Start neutral
+        self.opponent_entropy_history = deque(maxlen=30)
+        self.anti_exploit_mode = False
+        self.counter_predict_detected = 0
+        
         # Per-strategy tracking
         self.strategy_wins = np.zeros(self.K, dtype=float)
         self.strategy_plays = np.zeros(self.K, dtype=float)
@@ -295,14 +302,17 @@ class RealTimeEvolvingRPS_TF:
         return random.choice(self.MOVES)
 
     def _get_context_key(self):
-        """Generate a context key from recent history."""
+        """Generate a context key from recent history - IMPROVED with results."""
         if len(self.opponent_history) < 2 or len(self.ai_history) < 2:
             return "early_game"
         
-        # Use last 2 moves from each side
+        # Enhanced: Include both moves AND recent results for better context
+        recent_outcome = self.results[-1] if self.results else 'd'
+        
         ctx = (
             self.ai_history[-2], self.ai_history[-1],
-            self.opponent_history[-2], self.opponent_history[-1]
+            self.opponent_history[-2], self.opponent_history[-1],
+            recent_outcome  # Add result to context
         )
         return ctx
 
@@ -483,14 +493,92 @@ class RealTimeEvolvingRPS_TF:
         # Return highest voted move
         return max(votes.items(), key=lambda x: x[1])[0]
 
+    # ========== PATTERN DETECTION ==========
+    
+    def _detect_randomness(self):
+        """Detect if opponent is playing randomly (no exploitable patterns)."""
+        if len(self.opponent_history) < 30:
+            return 0.5  # Not enough data
+        
+        recent = list(self.opponent_history)[-30:]
+        counts = Counter(recent)
+        
+        # Check if distribution is close to 33/33/33
+        expected = len(recent) / 3.0
+        max_deviation = max(abs(counts.get(m, 0) - expected) for m in self.MOVES)
+        
+        # Check entropy (randomness measure)
+        total = len(recent)
+        entropy = 0.0
+        for move in self.MOVES:
+            p = counts.get(move, 0) / total
+            if p > 0:
+                entropy -= p * np.log2(p)
+        
+        # Perfect random has entropy ~1.585
+        # Lower entropy = more predictable
+        randomness = entropy / 1.585
+        
+        # IMPROVED: Check for sequential patterns (autocorrelation)
+        # Even if distribution is 33/33/33, repeating patterns are exploitable
+        move_to_idx = {m: i for i, m in enumerate(self.MOVES)}
+        sequence = [move_to_idx[m] for m in recent]
+        
+        # Check for repeating cycles
+        has_cycle = False
+        for cycle_len in range(2, min(6, len(sequence) // 3)):
+            # Check if sequence repeats with this cycle length
+            matches = 0
+            total_checks = len(sequence) - cycle_len
+            for i in range(len(sequence) - cycle_len):
+                if sequence[i] == sequence[i + cycle_len]:
+                    matches += 1
+            
+            if total_checks > 0 and matches / total_checks > 0.6:  # 60%+ correlation
+                has_cycle = True
+                randomness *= 0.3  # Heavily reduce randomness score
+                break
+        
+        # Also check if our strategies are actually winning
+        recent_wr = self.recent_results.count('w') / len(self.recent_results) if self.recent_results else 0.33
+        
+        # If we're winning significantly more than 33%, opponent is exploitable
+        if recent_wr > 0.42:  # Raised threshold slightly
+            randomness = max(0.0, randomness - 0.4)
+        
+        return randomness
+    
+    def _calculate_pattern_confidence(self):
+        """Calculate confidence in detected patterns."""
+        if len(self.opponent_history) < 10:
+            return 0.0
+        
+        # Check how well our predictions have been doing
+        recent_wr = self.recent_results.count('w') / len(self.recent_results) if self.recent_results else 0.33
+        
+        # Check consistency of strategies
+        strategy_consistency = 0.0
+        for recent_perf in self.strategy_recent:
+            if len(recent_perf) > 0:
+                wr = recent_perf.count('w') / len(recent_perf)
+                if wr > 0.4:  # Strategy is actually working
+                    strategy_consistency = max(strategy_consistency, wr)
+        
+        # Combine metrics
+        confidence = (recent_wr - 0.33) * 2.0  # Scale so 50% WR = ~33% confidence
+        confidence = max(0.0, min(1.0, confidence))
+        
+        return confidence
+    
     # ========== MOVE SELECTION ==========
     
     def get_move(self):
         """Select move using ensemble + context-based Q-learning."""
         
-        # If we're on a losing streak, increase exploration dramatically
+        # FIXED: If we're on a losing streak, DECREASE exploration to focus on what works
         if self.losing_streak >= 2:  # React faster
-            self.gamma = min(0.7, 0.25 + (self.losing_streak * 0.15))
+            # Lower gamma = less exploration, more exploitation of proven strategies
+            self.gamma = max(0.05, 0.25 - (self.losing_streak * 0.05))
             
             # If we just lost, AVOID (but don't always skip) the same move in similar context
             if self.last_loss_context and self.last_loss_move and random.random() < 0.7:
@@ -499,6 +587,19 @@ class RealTimeEvolvingRPS_TF:
                     print(f"🚫 Avoiding {self.last_loss_move.upper()} - it just lost!")
         else:
             self.gamma = 0.25  # Reset to default
+        
+        # NEW: Update pattern detection metrics
+        self.randomness_score = self._detect_randomness()
+        self.pattern_confidence = self._calculate_pattern_confidence()
+        
+        # If opponent appears highly random (>0.8) AND we're not winning, use Nash equilibrium
+        if self.randomness_score > 0.8 and self.pattern_confidence < 0.2:
+            if random.random() < 0.7:  # 70% of time against random
+                nash_move = random.choice(self.MOVES)
+                print(f"🎲 Nash equilibrium: {nash_move.upper()} (opponent appears random: {self.randomness_score:.2f})")
+                self.last_ai_move = nash_move
+                self.prediction_confidence = 0.33
+                return nash_move
         
         # Get context-based best action (Q-learning)
         context = self._get_context_key()
@@ -514,23 +615,23 @@ class RealTimeEvolvingRPS_TF:
                     if len(temp_available) >= 2:  # Keep at least 2 options
                         available_moves = temp_available
         
-        # Use context-based learning SOMETIMES (not always)
-        use_context = random.random() < 0.4  # Only 40% of time
+        # IMPROVED: Use context-based learning more often when we have good data
+        use_context = random.random() < 0.7  # Increased to 70% when we have patterns
         if use_context and context in self.context_actions and self.total_rounds > 5:
             action_stats = self.context_actions[context]
             action_values = {}
             for move in available_moves:
                 w, l, d = action_stats[move]
                 total = w + l + d
-                if total > 1:  # Very low threshold
+                if total > 2:  # Need at least 3 samples
                     # Value = win_rate - loss_rate
                     action_values[move] = (w - l) / total
             
             if action_values:
                 # Add randomness - don't always pick the best
-                if random.random() < 0.7:  # 70% pick best, 30% pick random from top 2
+                if random.random() < 0.8:  # 80% pick best, 20% explore
                     sorted_moves = sorted(action_values.items(), key=lambda x: x[1], reverse=True)
-                    if len(sorted_moves) >= 2 and random.random() < 0.3:
+                    if len(sorted_moves) >= 2 and random.random() < 0.15:
                         best_move = sorted_moves[1][0]  # Pick second best sometimes
                     else:
                         best_move = sorted_moves[0][0]
@@ -538,10 +639,21 @@ class RealTimeEvolvingRPS_TF:
                     best_move = random.choice(list(action_values.keys()))
                 
                 best_value = action_values[best_move]
-                if best_value > -0.5:  # More lenient threshold
+                if best_value > 0.0:  # FIXED: Only use if actually winning (stricter threshold)
                     print(f"📊 Context-based: {best_move.upper()} (value: {best_value:.2f})")
                     self.last_strategy_idx = None
                     self.prediction_confidence = 0.6
+                    
+                    # NEW: Anti-exploitation - if opponent keeps beating our context moves, break pattern
+                    if context in self.context_actions:
+                        total_context_plays = sum(self.context_actions[context][best_move])
+                        if total_context_plays >= 5:
+                            w, l, d = self.context_actions[context][best_move]
+                            if l > w + 2:  # Losing significantly in this context
+                                if random.random() < 0.4:  # 40% chance to randomize
+                                    best_move = random.choice([m for m in self.MOVES if m != best_move])
+                                    print(f"🛡️ Anti-exploit: switching to {best_move.upper()}")
+                    
                     return best_move
         
         # Otherwise use EXP3 + strategies (most of the time)
@@ -661,13 +773,16 @@ class RealTimeEvolvingRPS_TF:
                         winning_move = self.BEATEN_BY[opponent_move]
                         y = self.one_hot(winning_move).astype(np.float32)
                         
-                        # Add multiple times if we lost
-                        if result == 'l':
-                            for _ in range(3):  # Learn more from mistakes
+                        # FIXED: Always train on winning move, but weight examples differently
+                        # Wins prove our prediction worked - add them MORE, not less
+                        if result == 'w':
+                            for _ in range(3):  # Learn from successful predictions
                                 self.tf_train_buffer.append((x.copy(), y.copy()))
-                        elif result == 'w':
-                            self.tf_train_buffer.append((x.copy(), self.one_hot(ai_move).astype(np.float32)))
+                        elif result == 'l':
+                            # Still learn from losses, but with less weight
+                            self.tf_train_buffer.append((x.copy(), y.copy()))
                         else:
+                            # Draws are neutral - moderate learning
                             self.tf_train_buffer.append((x.copy(), y.copy()))
                 except Exception as e:
                     print(f"⚠️ TF buffer error: {e}")
@@ -678,14 +793,14 @@ class RealTimeEvolvingRPS_TF:
             # Track per-strategy results
             self.strategy_recent[self.last_strategy_idx].append(result)
             
-            # Reward/penalty
+            # FIXED: Stronger reward/penalty for faster learning
             if result == 'w':
-                reward = 1.5  # Increased reward
+                reward = 2.0  # Stronger reward for wins
                 self.strategy_wins[self.last_strategy_idx] += 1.0
             elif result == 'l':
-                reward = -1.0  # Stronger penalty
+                reward = -2.0  # Stronger penalty for losses
             else:
-                reward = 0.0
+                reward = 0.1  # Small reward for draws (better than losing)
             
             # Boost learning rate when losing
             effective_eta = self.eta * (2.0 if self.losing_streak >= 3 else 1.0)
