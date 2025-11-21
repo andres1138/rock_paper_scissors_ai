@@ -1,4 +1,13 @@
 .venv
 __pycache__/
 .DS_Store
+rps_beast_tf_model
+rps_monster_tf_model_confidence
+rps_monster_tf_model_main
+rps_monster_tf_model_pattern
+DEBUG_NOTES.md
+README_ENTRY_GUIDE.md
+README_MONSTER.md
+rps_monster_state.pkl
 rps_beast_state.pkl
+smoke_test_state.pkl
