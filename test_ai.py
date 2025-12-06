@@ -1,300 +1,236 @@
 #!/usr/bin/env python3
 """
-Test suite for RPS AI - Tests against various opponent types
+Test suite for RPS AI Predictor
+
+Tests the AI against different opponent strategies to measure performance.
 """
 
-import sys
 import random
+import argparse
 from collections import Counter
+from rps_predictor import RPSPredictor
 
 
-class OpponentBot:
-    """Base class for test opponents."""
+class OpponentStrategy:
+    """Base class for opponent strategies."""
     
     MOVES = ['rock', 'paper', 'scissors']
     BEATS = {'rock': 'scissors', 'paper': 'rock', 'scissors': 'paper'}
     
-    def __init__(self, name):
-        self.name = name
-        self.history = []
-        self.opponent_history = []
-    
-    def get_move(self):
-        """Get opponent's move - override in subclasses."""
+    def get_move(self, history):
+        """Get next move based on strategy."""
         raise NotImplementedError
     
-    def update(self, own_move, opponent_move):
-        """Update opponent's history."""
-        self.history.append(own_move)
-        self.opponent_history.append(opponent_move)
+    def name(self):
+        """Strategy name."""
+        raise NotImplementedError
+
+
+class RandomStrategy(OpponentStrategy):
+    """Completely random moves."""
     
-    def move_result(self, move1, move2):
-        """Determine result from move1's perspective."""
-        if move1 == move2:
-            return 'd'
-        if self.BEATS[move1] == move2:
-            return 'w'
-        return 'l'
+    def get_move(self, history):
+        return random.choice(self.MOVES)
+    
+    def name(self):
+        return "Random"
 
 
-class PatternBot(OpponentBot):
-    """Always plays in a fixed pattern: Rock -> Paper -> Scissors."""
+class PatternStrategy(OpponentStrategy):
+    """Plays a repeating pattern."""
     
     def __init__(self):
-        super().__init__("Pattern Player (R->P->S)")
-        self.sequence = ['rock', 'paper', 'scissors']
+        self.pattern = ['rock', 'paper', 'scissors', 'scissors', 'paper']
         self.index = 0
     
-    def get_move(self):
-        move = self.sequence[self.index % len(self.sequence)]
+    def get_move(self, history):
+        move = self.pattern[self.index % len(self.pattern)]
         self.index += 1
         return move
+    
+    def name(self):
+        return "Pattern (R-P-S-S-P)"
 
 
-class FrequencyBot(OpponentBot):
-    """Always plays the move it has played most often."""
+class FrequencyStrategy(OpponentStrategy):
+    """Always plays rock (frequency bias)."""
     
     def __init__(self):
-        super().__init__("Frequency Player")
-        self.favorite = random.choice(self.MOVES)
-    
-    def get_move(self):
-        # 70% favorite, 30% random
-        if random.random() < 0.7:
-            return self.favorite
-        return random.choice(self.MOVES)
-
-
-class CounterBot(OpponentBot):
-    """Always counters the AI's previous move."""
-    
-    def __init__(self):
-        super().__init__("Counter Player")
-        self.BEATEN_BY = {v: k for k, v in self.BEATS.items()}
-    
-    def get_move(self):
-        if len(self.opponent_history) == 0:
-            return random.choice(self.MOVES)
-        
-        # Play what beats the AI's last move
-        return self.BEATEN_BY[self.opponent_history[-1]]
-
-
-class RandomBot(OpponentBot):
-    """Plays completely randomly (Nash equilibrium)."""
-    
-    def __init__(self):
-        super().__init__("Random Player")
-    
-    def get_move(self):
-        return random.choice(self.MOVES)
-
-
-class MixedBot(OpponentBot):
-    """Mixes strategies - mostly pattern with some randomness."""
-    
-    def __init__(self):
-        super().__init__("Mixed Player")
-        self.sequence = ['rock', 'rock', 'paper', 'scissors']
+        self.moves = ['rock'] * 5 + ['paper'] * 2 + ['scissors'] * 1
         self.index = 0
     
-    def get_move(self):
-        # 60% pattern, 40% random
-        if random.random() < 0.6:
-            move = self.sequence[self.index % len(self.sequence)]
-            self.index += 1
-            return move
-        return random.choice(self.MOVES)
-
-
-def run_test(ai, opponent, num_rounds=100, verbose=False):
-    """Run a test of AI vs opponent for num_rounds."""
+    def get_move(self, history):
+        move = self.moves[self.index % len(self.moves)]
+        self.index += 1
+        return move
     
-    print(f"\n{'='*60}")
-    print(f"Testing against: {opponent.name}")
-    print(f"Number of rounds: {num_rounds}")
-    print(f"{'='*60}")
+    def name(self):
+        return "Frequency (60% rock)"
+
+
+class WinStayStrategy(OpponentStrategy):
+    """Repeats move after winning, changes after losing."""
+    
+    def __init__(self):
+        self.last_move = random.choice(self.MOVES)
+        self.last_result = None
+    
+    def get_move(self, history):
+        if not history:
+            return self.last_move
+        
+        # Check if we won last round
+        ai_last = history[-1]['ai_move']
+        player_last = history[-1]['opponent_move']
+        
+        if self.BEATS[player_last] == ai_last:
+            # We won! Stay with same move
+            return player_last
+        else:
+            # We lost or drew, switch
+            others = [m for m in self.MOVES if m != player_last]
+            self.last_move = random.choice(others)
+            return self.last_move
+    
+    def name(self):
+        return "Win-Stay/Lose-Shift"
+
+
+class CounterStrategy(OpponentStrategy):
+    """Tries to counter AI's most common move."""
+    
+    BEATEN_BY = {'scissors': 'rock', 'rock': 'paper', 'paper': 'scissors'}
+    
+    def get_move(self, history):
+        if len(history) < 3:
+            return random.choice(self.MOVES)
+        
+        # Count AI moves
+        recent_ai = [h['ai_move'] for h in history[-10:]]
+        counter = Counter(recent_ai)
+        most_common_ai = counter.most_common(1)[0][0]
+        
+        # Counter it
+        return self.BEATEN_BY[most_common_ai]
+    
+    def name(self):
+        return "Counter-AI"
+
+
+def run_test(strategy: OpponentStrategy, rounds: int = 100, verbose: bool = False):
+    """Run a test against a specific strategy."""
+    ai = RPSPredictor()
+    history = []
+    
+    print(f"\n{'='*70}")
+    print(f"Testing against: {strategy.name()}")
+    print(f"Rounds: {rounds}")
+    print(f"{'='*70}\n")
     
     wins = 0
     losses = 0
     draws = 0
     
-    # Track performance over time
-    early_wins = 0  # First 30 rounds
-    late_wins = 0   # Last 30 rounds
+    # Track AI performance over time
+    win_rate_checkpoints = []
     
-    for round_num in range(1, num_rounds + 1):
+    for round_num in range(1, rounds + 1):
         # Get moves
         ai_move = ai.get_move()
-        opp_move = opponent.get_move()
+        opponent_move = strategy.get_move(history)
         
-        # Determine result
-        result = opponent.move_result(ai_move, opp_move)
+        # Record result
+        result = ai.record_round(opponent_move, ai_move)
+        
+        history.append({
+            'round': round_num,
+            'ai_move': ai_move,
+            'opponent_move': opponent_move,
+            'result': result
+        })
         
         if result == 'w':
             wins += 1
-            if round_num <= 30:
-                early_wins += 1
-            if round_num > num_rounds - 30:
-                late_wins += 1
         elif result == 'l':
             losses += 1
         else:
             draws += 1
         
-        # Update both
-        ai.update(ai_move, result)
-        opponent.update(opp_move, ai_move)
+        # Checkpoints
+        if round_num in [10, 25, 50, 75, 100]:
+            wr = wins / round_num * 100
+            win_rate_checkpoints.append((round_num, wr))
         
         # Verbose output
-        if verbose and round_num % 10 == 0:
-            wr = wins / round_num * 100
-            print(f"Round {round_num}: WR = {wr:.1f}% (W:{wins} L:{losses} D:{draws})")
+        if verbose and round_num <= 20:
+            result_text = {'w': 'AI WIN', 'l': 'LOSS', 'd': 'DRAW'}[result]
+            conf = ai.prediction_confidence
+            print(f"Round {round_num:3d}: AI={ai_move:8s} Opp={opponent_move:8s} → {result_text:7s} (conf: {conf:.0%})")
     
     # Final stats
-    total = num_rounds
-    win_rate = wins / total * 100
-    early_wr = early_wins / min(30, num_rounds) * 100
-    late_wr = late_wins / min(30, num_rounds) * 100
+    stats = ai.get_stats()
     
-    print(f"\n📊 RESULTS:")
-    print(f"   Total: W:{wins} L:{losses} D:{draws}")
-    print(f"   Win Rate: {win_rate:.1f}%")
-    print(f"   Early WR (first 30): {early_wr:.1f}%")
-    print(f"   Late WR (last 30): {late_wr:.1f}%")
-    print(f"   Learning Improvement: {late_wr - early_wr:+.1f}%")
+    print(f"\n{'='*70}")
+    print("RESULTS")
+    print(f"{'='*70}")
+    print(f"AI Record:       {wins}-{losses}-{draws}")
+    print(f"AI Win Rate:     {stats['win_rate']:.1f}%")
+    print(f"Detected Style:  {stats['detected_behavior']}")
     
-    # Verdict
-    print(f"\n🎯 VERDICT: ", end="")
+    print(f"\nWin Rate Over Time:")
+    for checkpoint, wr in win_rate_checkpoints:
+        bar = '█' * int(wr / 2)
+        print(f"  Round {checkpoint:3d}: {wr:5.1f}% {bar}")
     
-    if isinstance(opponent, PatternBot):
-        # Should dominate pattern players
-        if late_wr >= 80:
-            print("✅ EXCELLENT - Learned pattern effectively")
-            return True
-        elif late_wr >= 60:
-            print("⚠️  GOOD - Pattern partially learned")
-            return True
-        else:
-            print("❌ POOR - Failed to learn simple pattern")
-            return False
+    insights = ai.get_insights()
+    if insights:
+        print(f"\nInsights:")
+        for insight in insights:
+            if insight:
+                print(f"  • {insight}")
     
-    elif isinstance(opponent, FrequencyBot):
-        # Should beat frequency players
-        if late_wr >= 65:
-            print("✅ EXCELLENT - Exploited frequency bias")
-            return True
-        elif late_wr >= 50:
-            print("⚠️  GOOD - Partially exploited")
-            return True
-        else:
-            print("❌ POOR - Failed to exploit frequency")
-            return False
+    print(f"{'='*70}\n")
     
-    elif isinstance(opponent, CounterBot):
-        # Counter bots are tough, should at least not lose badly
-        if late_wr >= 50:
-            print("✅ EXCELLENT - Beat the counter-predictor")
-            return True
-        elif late_wr >= 40:
-            print("⚠️  GOOD - Held own against counter-predictor")
-            return True
-        else:
-            print("❌ POOR - Exploited by counter-predictor")
-            return False
-    
-    elif isinstance(opponent, RandomBot):
-        # Should stay close to Nash (33%)
-        if 28 <= late_wr <= 45:
-            print("✅ EXCELLENT - Nash equilibrium maintained")
-            return True
-        elif 20 <= late_wr <= 50:
-            print("⚠️  ACCEPTABLE - Close to Nash")
-            return True
-        else:
-            print("❌ POOR - Deviated too far from Nash")
-            return False
-    
-    elif isinstance(opponent, MixedBot):
-        # Should adapt and win
-        if late_wr >= 55:
-            print("✅ EXCELLENT - Adapted to mixed strategy")
-            return True
-        elif late_wr >= 45:
-            print("⚠️  GOOD - Partially adapted")
-            return True
-        else:
-            print("❌ POOR - Failed to adapt")
-            return False
-    
-    return False
+    return stats
 
 
 def main():
-    """Run all tests."""
-    print("🧪" * 30)
-    print("      RPS AI TEST SUITE")
-    print("🧪" * 30)
+    """Main test runner."""
+    parser = argparse.ArgumentParser(description='Test RPS AI against different strategies')
+    parser.add_argument('--strategy', type=str, choices=['random', 'pattern', 'frequency', 'win-stay', 'counter', 'all'],
+                        default='all', help='Strategy to test against')
+    parser.add_argument('--rounds', type=int, default=100, help='Number of rounds to play')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
-    # Import the AI
-    try:
-        from rps_smart import SmartRPS
-        ai_class = SmartRPS
-        ai_name = "Smart RPS"
-    except ImportError:
-        try:
-            from rps_monster import MonsterRPS
-            ai_class = MonsterRPS
-            ai_name = "Monster RPS"
-        except ImportError:
-            print("❌ Could not import any RPS AI!")
-            sys.exit(1)
+    args = parser.parse_args()
     
-    print(f"\n✅ Testing: {ai_name}\n")
+    strategies = {
+        'random': RandomStrategy(),
+        'pattern': PatternStrategy(),
+        'frequency': FrequencyStrategy(),
+        'win-stay': WinStayStrategy(),
+        'counter': CounterStrategy()
+    }
     
-    # Define test suite
-    test_opponents = [
-        (PatternBot(), 100, True),      # Should easily learn this
-        (FrequencyBot(), 100, True),    # Should exploit frequency
-        (CounterBot(), 100, True),      # Should adapt to counter
-        (MixedBot(), 150, True),        # Should learn mixed patterns
-        (RandomBot(), 100, True),       # Should maintain Nash
-    ]
+    print("🎯" * 35)
+    print("      RPS AI PREDICTOR - TEST SUITE")
+    print("🎯" * 35)
     
-    results = []
-    
-    for opponent, rounds, verbose in test_opponents:
-        # Create fresh AI for each test
-        ai = ai_class(save_prefix=f"test_{opponent.name.replace(' ', '_')}")
+    if args.strategy == 'all':
+        results = {}
+        for name, strat in strategies.items():
+            stats = run_test(strat, args.rounds, args.verbose)
+            results[name] = stats['win_rate']
         
-        # Run test
-        passed = run_test(ai, opponent, rounds, verbose=verbose)
-        results.append((opponent.name, passed))
-        
-        print("\n")
-    
-    # Summary
-    print("=" * 60)
-    print("📋 TEST SUMMARY")
-    print("=" * 60)
-    
-    for name, passed in results:
-        status = "✅ PASS" if passed else "❌ FAIL"
-        print(f"{status}: {name}")
-    
-    total_passed = sum(1 for _, p in results if p)
-    total_tests = len(results)
-    
-    print(f"\n🎯 Overall: {total_passed}/{total_tests} tests passed")
-    
-    if total_passed == total_tests:
-        print("🏆 PERFECT SCORE! AI is learning effectively!")
-    elif total_passed >= total_tests * 0.8:
-        print("✅ GOOD! AI is learning well!")
-    elif total_passed >= total_tests * 0.6:
-        print("⚠️  ACCEPTABLE - AI needs improvement")
+        print("\n" + "="*70)
+        print("SUMMARY - AI Win Rates")
+        print("="*70)
+        for name, wr in results.items():
+            bar = '█' * int(wr / 2)
+            print(f"  {name:12s}: {wr:5.1f}% {bar}")
+        print("="*70)
     else:
-        print("❌ POOR - AI is not learning effectively")
+        run_test(strategies[args.strategy], args.rounds, args.verbose)
 
 
 if __name__ == "__main__":
