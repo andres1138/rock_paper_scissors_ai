@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Advanced RPS Predictor - Pattern & Behavioral Analysis Engine (v2.0)
+Beast-Tier RPS Predictor v4.0 — Multi-Layer Meta-Strategy Engine
 
-Key Improvements:
-- Meta-learning with prediction accuracy tracking
-- Proper Nash equilibrium fallback
-- Confidence calibration based on performance
-- Counter-exploitation detection
-- Increased sample size requirements
+Inspired by competition-winning bots (Iocaine Powder, Dan Egnor's algorithm).
+Uses 6 base predictors × 3 meta-levels = 18 competing strategies.
+Automatically selects the best counter-level for any opponent.
+
+Architecture:
+  - Base Predictors: frequency, markov-1, markov-2, n-gram(3-6), 
+    win-stay/lose-shift, history-match, rotation-detect, context-predictor
+  - Meta-Levels: P0 (direct predict), P1 (counter their counter), P2 (double counter)
+  - Strategy scoring with exponential decay for rapid adaptation
+  - Nash equilibrium fallback as anti-exploitation shield
 """
 
 import random
@@ -18,293 +22,703 @@ from collections import deque, Counter, defaultdict
 from typing import Optional, Dict, Tuple, List
 
 
-class PredictionTracker:
-    """Tracks prediction accuracy to enable meta-learning."""
-    
-    def __init__(self, window_size: int = 20):
-        self.window_size = window_size
-        self.predictions = deque(maxlen=window_size)
-        self.total_predictions = 0
-        self.correct_predictions = 0
-    
-    def record(self, predicted_move: str, actual_move: str, confidence: float):
-        """Record a prediction and its outcome."""
-        correct = (predicted_move == actual_move)
-        self.predictions.append({
-            'predicted': predicted_move,
-            'actual': actual_move,
-            'confidence': confidence,
-            'correct': correct
-        })
-        
-        self.total_predictions += 1
-        if correct:
-            self.correct_predictions += 1
-    
-    def get_accuracy(self) -> float:
-        """Get recent prediction accuracy (0.0-1.0)."""
-        if not self.predictions:
-            return 0.33  # Random baseline
-        
-        correct = sum(1 for p in self.predictions if p['correct'])
-        return correct / len(self.predictions)
-    
-    def get_lifetime_accuracy(self) -> float:
-        """Get overall prediction accuracy."""
-        if self.total_predictions == 0:
-            return 0.33
-        return self.correct_predictions / self.total_predictions
-    
-    def should_trust_predictions(self) -> bool:
-        """Returns True if predictions are better than random."""
-        accuracy = self.get_accuracy()
-        # Need to be significantly better than random (33.33%) to trust
-        return accuracy > 0.40 and len(self.predictions) >= 10
+# ─── Constants ───────────────────────────────────────────────────────────
+
+MOVES = ['rock', 'paper', 'scissors']
+BEATS = {'rock': 'scissors', 'paper': 'rock', 'scissors': 'paper'}
+BEATEN_BY = {'scissors': 'rock', 'rock': 'paper', 'paper': 'scissors'}
+MOVE_INDEX = {'rock': 0, 'paper': 1, 'scissors': 2}
+INDEX_MOVE = {0: 'rock', 1: 'paper', 2: 'scissors'}
 
 
-class StrategyPerformance:
-    """Tracks performance of individual prediction strategies."""
-    
-    def __init__(self, window_size: int = 15):
-        self.window_size = window_size
-        self.strategy_predictions = defaultdict(lambda: deque(maxlen=window_size))
-        self.strategy_total = defaultdict(int)
-        self.strategy_correct = defaultdict(int)
-    
-    def record(self, strategy_name: str, predicted_move: str, actual_move: str):
-        """Record a strategy prediction and its outcome."""
-        correct = (predicted_move == actual_move)
-        self.strategy_predictions[strategy_name].append(correct)
-        self.strategy_total[strategy_name] += 1
-        if correct:
-            self.strategy_correct[strategy_name] += 1
-    
-    def get_strategy_accuracy(self, strategy_name: str) -> float:
-        """Get recent accuracy for a specific strategy."""
-        predictions = self.strategy_predictions[strategy_name]
-        if not predictions:
-            return 0.33  # Random baseline
-        return sum(predictions) / len(predictions)
-    
-    def get_best_strategy(self) -> Optional[str]:
-        """Get the currently best-performing strategy."""
-        best_strategy = None
-        best_accuracy = 0.35  # Must beat random by margin
-        
-        for strategy_name, predictions in self.strategy_predictions.items():
-            if len(predictions) >= 5:  # Need minimum samples
-                accuracy = sum(predictions) / len(predictions)
-                if accuracy > best_accuracy:
-                    best_accuracy = accuracy
-                    best_strategy = strategy_name
-        
-        return best_strategy
-    
-    def get_strategy_weight(self, strategy_name: str) -> float:
-        """Get confidence multiplier for a strategy based on its performance."""
-        predictions = self.strategy_predictions[strategy_name]
-        if len(predictions) < 3:
-            return 1.0  # Neutral weight for unproven strategies
-        
-        accuracy = sum(predictions) / len(predictions)
-        
-        # Convert accuracy to weight multiplier
-        if accuracy >= 0.70:  # Excellent
-            return 1.4
-        elif accuracy >= 0.60:  # Very good
-            return 1.25
-        elif accuracy >= 0.50:  # Good
-            return 1.1
-        elif accuracy >= 0.40:  # Okay
-            return 1.0
-        elif accuracy >= 0.30:  # Below random
-            return 0.8
-        else:  # Terrible
-            return 0.5
+def rotate_move(move: str, steps: int) -> str:
+    """Rotate a move by steps in the cycle rock->paper->scissors."""
+    idx = MOVE_INDEX[move]
+    return INDEX_MOVE[(idx + steps) % 3]
 
+
+def counter(move: str) -> str:
+    """Return the move that beats the given move."""
+    return BEATEN_BY[move]
+
+
+def counter_n(move: str, levels: int) -> str:
+    """Apply counter `levels` times. 0=same, 1=beat it, 2=beat the counter, etc."""
+    m = move
+    for _ in range(levels):
+        m = BEATEN_BY[m]
+    return m
+
+
+# ─── Base Predictors ─────────────────────────────────────────────────────
+
+class BasePredictor:
+    """Base class for all predictors. Predicts opponent's next move."""
+    
+    def __init__(self, name: str):
+        self.name = name
+    
+    def predict(self, opp_history: list, my_history: list, results: list) -> Optional[str]:
+        """Return predicted opponent move, or None if no prediction."""
+        raise NotImplementedError
+    
+    def reset(self):
+        """Reset any internal state."""
+        pass
+
+
+class FrequencyPredictor(BasePredictor):
+    """Predict based on overall move frequency."""
+    
+    def __init__(self):
+        super().__init__("frequency")
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 5:
+            return None
+        counts = Counter(opp_history[-30:])
+        total = sum(counts.values())
+        most_common, count = counts.most_common(1)[0]
+        if count / total >= 0.38:
+            return most_common
+        return None
+
+
+class RecentFrequencyPredictor(BasePredictor):
+    """Predict based on very recent move frequency (last 8 moves)."""
+    
+    def __init__(self):
+        super().__init__("recent_freq")
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 6:
+            return None
+        counts = Counter(opp_history[-8:])
+        most_common, count = counts.most_common(1)[0]
+        if count >= 4:
+            return most_common
+        return None
+
+
+class Markov1Predictor(BasePredictor):
+    """First-order Markov: predict based on last opponent move."""
+    
+    def __init__(self):
+        super().__init__("markov1")
+        self.transitions = defaultdict(Counter)
+    
+    def predict(self, opp_history, my_history, results):
+        # Rebuild transitions from history (lightweight)
+        if len(opp_history) < 4:
+            return None
+        
+        self.transitions.clear()
+        for i in range(len(opp_history) - 1):
+            self.transitions[opp_history[i]][opp_history[i + 1]] += 1
+        
+        last = opp_history[-1]
+        if last in self.transitions and sum(self.transitions[last].values()) >= 3:
+            most_common, count = self.transitions[last].most_common(1)[0]
+            total = sum(self.transitions[last].values())
+            if count / total >= 0.38:
+                return most_common
+        return None
+    
+    def reset(self):
+        self.transitions.clear()
+
+
+class Markov2Predictor(BasePredictor):
+    """Second-order Markov: predict based on last 2 opponent moves."""
+    
+    def __init__(self):
+        super().__init__("markov2")
+        self.transitions = defaultdict(Counter)
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 5:
+            return None
+        
+        self.transitions.clear()
+        for i in range(len(opp_history) - 2):
+            key = (opp_history[i], opp_history[i + 1])
+            self.transitions[key][opp_history[i + 2]] += 1
+        
+        key = (opp_history[-2], opp_history[-1])
+        if key in self.transitions and sum(self.transitions[key].values()) >= 2:
+            most_common, count = self.transitions[key].most_common(1)[0]
+            total = sum(self.transitions[key].values())
+            if count / total >= 0.35:
+                return most_common
+        return None
+    
+    def reset(self):
+        self.transitions.clear()
+
+
+class NgramPredictor(BasePredictor):
+    """N-gram predictor for sequences of length 3-6."""
+    
+    def __init__(self, n: int):
+        super().__init__(f"ngram{n}")
+        self.n = n
+        self.patterns = defaultdict(Counter)
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < self.n + 2:
+            return None
+        
+        self.patterns.clear()
+        for i in range(len(opp_history) - self.n):
+            key = tuple(opp_history[i:i + self.n])
+            self.patterns[key][opp_history[i + self.n]] += 1
+        
+        key = tuple(opp_history[-self.n:])
+        if key in self.patterns and sum(self.patterns[key].values()) >= 2:
+            most_common, count = self.patterns[key].most_common(1)[0]
+            total = sum(self.patterns[key].values())
+            if count / total >= 0.35:
+                return most_common
+        return None
+    
+    def reset(self):
+        self.patterns.clear()
+
+
+class ContextPredictor(BasePredictor):
+    """Predict based on (opponent_move, my_move, result) context triples."""
+    
+    def __init__(self):
+        super().__init__("context")
+        self.patterns = defaultdict(Counter)
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 5 or len(my_history) < 2 or len(results) < 2:
+            return None
+        
+        self.patterns.clear()
+        min_len = min(len(opp_history), len(my_history), len(results))
+        for i in range(min_len - 1):
+            key = (opp_history[i], my_history[i], results[i])
+            self.patterns[key][opp_history[i + 1]] += 1
+        
+        key = (opp_history[-1], my_history[-1], results[-1])
+        if key in self.patterns and sum(self.patterns[key].values()) >= 2:
+            most_common, count = self.patterns[key].most_common(1)[0]
+            total = sum(self.patterns[key].values())
+            if count / total >= 0.35:
+                return most_common
+        return None
+    
+    def reset(self):
+        self.patterns.clear()
+
+
+class DoubleContextPredictor(BasePredictor):
+    """Predict based on (opp[-2], opp[-1], my[-1], result[-1]) — deeper context."""
+    
+    def __init__(self):
+        super().__init__("double_context")
+        self.patterns = defaultdict(Counter)
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 8 or len(my_history) < 3 or len(results) < 3:
+            return None
+        
+        self.patterns.clear()
+        min_len = min(len(opp_history), len(my_history), len(results))
+        for i in range(1, min_len - 1):
+            key = (opp_history[i - 1], opp_history[i], my_history[i], results[i])
+            self.patterns[key][opp_history[i + 1]] += 1
+        
+        key = (opp_history[-2], opp_history[-1], my_history[-1], results[-1])
+        if key in self.patterns and sum(self.patterns[key].values()) >= 2:
+            most_common, count = self.patterns[key].most_common(1)[0]
+            total = sum(self.patterns[key].values())
+            if count / total >= 0.35:
+                return most_common
+        return None
+    
+    def reset(self):
+        self.patterns.clear()
+
+
+class WinStayLoseShiftPredictor(BasePredictor):
+    """Detect and exploit Win-Stay/Lose-Shift behavior."""
+    
+    def __init__(self):
+        super().__init__("winstay")
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 4 or len(results) < 2:
+            return None
+        
+        # Count WSLS behavior
+        min_len = min(len(opp_history), len(results))
+        win_repeat = win_total = 0
+        lose_switch = lose_total = 0
+        
+        for i in range(1, min_len):
+            prev_result = results[i - 1]
+            did_repeat = (opp_history[i] == opp_history[i - 1])
+            
+            if prev_result == 'l':  # AI lost = opponent won
+                win_total += 1
+                if did_repeat:
+                    win_repeat += 1
+            elif prev_result == 'w':  # AI won = opponent lost
+                lose_total += 1
+                if not did_repeat:
+                    lose_switch += 1
+        
+        last_result = results[-1]
+        last_opp = opp_history[-1]
+        
+        # WSLS after opponent won
+        if last_result == 'l' and win_total >= 3:
+            repeat_rate = win_repeat / win_total
+            if repeat_rate >= 0.55:
+                return last_opp  # They'll repeat
+        
+        # WSLS after opponent lost
+        if last_result == 'w' and lose_total >= 3:
+            switch_rate = lose_switch / lose_total
+            if switch_rate >= 0.55:
+                # They'll switch — predict which move they switch TO
+                other_moves = [m for m in MOVES if m != last_opp]
+                # Check if they have a preferred switch target
+                switch_targets = Counter()
+                for i in range(1, min_len):
+                    if results[i - 1] == 'w' and opp_history[i] != opp_history[i - 1]:
+                        switch_targets[opp_history[i]] += 1
+                
+                if switch_targets:
+                    return switch_targets.most_common(1)[0][0]
+                else:
+                    return random.choice(other_moves)
+        
+        return None
+
+
+class HistoryMatchPredictor(BasePredictor):
+    """Find the longest matching suffix in history and predict next move."""
+    
+    def __init__(self):
+        super().__init__("history_match")
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 8:
+            return None
+        
+        best_match_len = 0
+        best_next_move = None
+        
+        # Try matching suffixes of length 2 to 10
+        for match_len in range(2, min(11, len(opp_history))):
+            suffix = opp_history[-match_len:]
+            
+            # Search for this pattern earlier in history
+            for i in range(len(opp_history) - match_len - 1):
+                if opp_history[i:i + match_len] == suffix:
+                    # Found a match! The next move after this pattern
+                    next_idx = i + match_len
+                    if next_idx < len(opp_history):
+                        if match_len > best_match_len:
+                            best_match_len = match_len
+                            best_next_move = opp_history[next_idx]
+        
+        if best_match_len >= 3:
+            return best_next_move
+        return None
+
+
+class RotationPredictor(BasePredictor):
+    """Detect cycling/rotation patterns with periods 2-8."""
+    
+    def __init__(self):
+        super().__init__("rotation")
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 8:
+            return None
+        
+        best_period = None
+        best_score = 0.0
+        
+        for period in range(2, min(9, len(opp_history) // 2)):
+            matches = 0
+            checks = 0
+            for i in range(len(opp_history) - period):
+                checks += 1
+                if opp_history[i] == opp_history[i + period]:
+                    matches += 1
+            
+            if checks >= period * 2:
+                score = matches / checks
+                if score > best_score and score >= 0.65:
+                    best_score = score
+                    best_period = period
+        
+        if best_period:
+            # Predict using the period
+            return opp_history[-best_period]
+        return None
+
+
+class AntiMirrorPredictor(BasePredictor):
+    """Detect if opponent mirrors or anti-mirrors our moves."""
+    
+    def __init__(self):
+        super().__init__("anti_mirror")
+        
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 8 or len(my_history) < 8:
+            return None
+        
+        # Check if opponent copies our previous move
+        copy_count = 0
+        counter_count = 0  
+        total = 0
+        
+        min_len = min(len(opp_history), len(my_history))
+        for i in range(1, min_len):
+            total += 1
+            if opp_history[i] == my_history[i - 1]:
+                copy_count += 1
+            if opp_history[i] == counter(my_history[i - 1]):
+                counter_count += 1
+        
+        if total >= 6:
+            if copy_count / total >= 0.50:
+                # Opponent copies our last move
+                return my_history[-1]
+            if counter_count / total >= 0.50:
+                # Opponent counters our last move
+                return counter(my_history[-1])
+        
+        return None
+
+
+class ResultContextPredictor(BasePredictor):
+    """Predict based only on the last result (what people do after W/L/D)."""
+    
+    def __init__(self):
+        super().__init__("result_context")
+        self.after_win = Counter()
+        self.after_loss = Counter()
+        self.after_draw = Counter()
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 6 or len(results) < 2:
+            return None
+        
+        self.after_win.clear()
+        self.after_loss.clear()
+        self.after_draw.clear()
+        
+        min_len = min(len(opp_history), len(results))
+        for i in range(1, min_len):
+            if results[i - 1] == 'l':  # AI lost = opp won
+                self.after_win[opp_history[i]] += 1
+            elif results[i - 1] == 'w':  # AI won = opp lost
+                self.after_loss[opp_history[i]] += 1
+            else:
+                self.after_draw[opp_history[i]] += 1
+        
+        last_result = results[-1]
+        
+        if last_result == 'l' and sum(self.after_win.values()) >= 3:
+            most_common, count = self.after_win.most_common(1)[0]
+            if count / sum(self.after_win.values()) >= 0.45:
+                return most_common
+        elif last_result == 'w' and sum(self.after_loss.values()) >= 3:
+            most_common, count = self.after_loss.most_common(1)[0]
+            if count / sum(self.after_loss.values()) >= 0.45:
+                return most_common
+        elif last_result == 'd' and sum(self.after_draw.values()) >= 3:
+            most_common, count = self.after_draw.most_common(1)[0]
+            if count / sum(self.after_draw.values()) >= 0.45:
+                return most_common
+        
+        return None
+
+
+class PairHistoryPredictor(BasePredictor):
+    """Predict based on (my_move, opp_move) pairs — joint context."""
+    
+    def __init__(self):
+        super().__init__("pair_history")
+        self.patterns = defaultdict(Counter)
+    
+    def predict(self, opp_history, my_history, results):
+        if len(opp_history) < 6 or len(my_history) < 2:
+            return None
+        
+        self.patterns.clear()
+        min_len = min(len(opp_history), len(my_history))
+        for i in range(min_len - 1):
+            key = (my_history[i], opp_history[i])
+            self.patterns[key][opp_history[i + 1]] += 1
+        
+        key = (my_history[-1], opp_history[-1])
+        if key in self.patterns and sum(self.patterns[key].values()) >= 2:
+            most_common, count = self.patterns[key].most_common(1)[0]
+            total = sum(self.patterns[key].values())
+            if count / total >= 0.40:
+                return most_common
+        return None
+    
+    def reset(self):
+        self.patterns.clear()
+
+
+# ─── Meta-Strategy Layer ─────────────────────────────────────────────────
+
+class MetaStrategy:
+    """
+    A meta-strategy wraps a base predictor with a meta-level.
+    
+    Meta-levels:
+      P0: Predict opponent's move directly, counter it
+      P1: Assume opponent predicts our P0 and counters => counter their counter
+      P2: Assume opponent counters our P1 => counter their counter-counter
+    """
+    
+    def __init__(self, predictor: BasePredictor, meta_level: int):
+        self.predictor = predictor
+        self.meta_level = meta_level
+        self.name = f"{predictor.name}.P{meta_level}"
+        
+        # Scoring with exponential decay
+        self.score = 0.0
+        self.decay = 0.90  # Forget old results fast
+        self.predictions_made = 0
+        self.recent_correct = 0
+        self.recent_total = 0
+    
+    def get_suggestion(self, opp_history: list, my_history: list, results: list) -> Optional[str]:
+        """Get the suggested move to play (what WE should throw)."""
+        prediction = self.predictor.predict(opp_history, my_history, results)
+        if prediction is None:
+            return None
+        
+        # Apply meta-level rotation
+        # P0: counter their predicted move (1 rotation)  
+        # P1: they predict we counter, so they play to beat our counter → we beat THAT (2 rotations)
+        # P2: 3 rotations
+        return counter_n(prediction, self.meta_level + 1)
+    
+    def get_predicted_opp_move(self, opp_history: list, my_history: list, results: list) -> Optional[str]:
+        """Get what we think opponent will play (for scoring)."""
+        return self.predictor.predict(opp_history, my_history, results)
+    
+    def update_score(self, would_have_won: bool, would_have_drawn: bool):
+        """Update the strategy's score based on what would have happened."""
+        self.score *= self.decay
+        
+        if would_have_won:
+            self.score += 1.0
+            self.recent_correct += 1
+        elif would_have_drawn:
+            self.score += 0.1
+        else:
+            self.score -= 0.5
+        
+        self.recent_total += 1
+    
+    def reset_score(self):
+        self.score = 0.0
+        self.recent_correct = 0
+        self.recent_total = 0
+
+
+# ─── Main Engine ─────────────────────────────────────────────────────────
 
 class RPSPredictor:
-    """Advanced Rock-Paper-Scissors AI that predicts opponent moves."""
+    """
+    Beast-Tier RPS AI v4.0 — Multi-Layer Meta-Strategy Engine
     
-    MOVES = ['rock', 'paper', 'scissors']
-    BEATS = {'rock': 'scissors', 'paper': 'rock', 'scissors': 'paper'}
-    BEATEN_BY = {'scissors': 'rock', 'rock': 'paper', 'paper': 'scissors'}
+    Runs multiple prediction strategies in parallel, each at multiple
+    meta-levels. Automatically selects the best one based on recent
+    performance. Falls back to Nash equilibrium when nothing works.
+    """
     
-    def __init__(self, memory_size: int = 40, save_file: str = "rps_ai_brain.pkl"):
-        """Initialize the predictor.
-        
-        Args:
-            memory_size: Number of recent moves to remember (default: 40)
-            save_file: Path to save/load learned patterns (default: rps_ai_brain.pkl)
-        """
+    MOVES = MOVES
+    BEATS = BEATS
+    BEATEN_BY = BEATEN_BY
+    
+    def __init__(self, memory_size: int = 200, save_file: str = "rps_ai_brain.pkl", 
+                 reset_brain: bool = False):
         self.memory_size = memory_size
         self.save_file = save_file
         
-        # Move history
-        self.player_moves = deque(maxlen=memory_size)
-        self.ai_moves = deque(maxlen=memory_size)
-        self.results = deque(maxlen=memory_size)  # 'w'=AI win, 'l'=AI loss, 'd'=draw
-        
-        # Pattern detection (STRICTER requirements)
-        self.sequences = defaultdict(Counter)  # (move1, move2, ...) -> Counter(next_move)
-        self.transitions = defaultdict(Counter)  # move -> Counter(next_move)
-        
-        # Behavioral modeling
-        self.win_responses = Counter()  # What player does after AI wins (player loses)
-        self.loss_responses = Counter()  # What player does after AI loses (player wins)
-        self.draw_responses = Counter()  # What player does after draw
-        self.move_preferences = Counter()  # Overall move frequencies
-        
-        # Win-Stay / Lose-Shift specific tracking
-        self.win_repeats = 0  # How many times player REPEATS after they WIN
-        self.win_switches = 0  # How many times player SWITCHES after they WIN
-        self.loss_repeats = 0  # How many times player REPEATS after they LOSE
-        self.loss_switches = 0  # How many times player SWITCHES after they LOSE
-        
-        # Meta-learning
-        self.prediction_tracker = PredictionTracker(window_size=20)
-        self.strategy_performance = StrategyPerformance(window_size=15)
-        
-        # Exploitation detection
-        self.opponent_counters_ai = 0  # Count of times opponent beat AI's most common move
-        self.recent_ai_moves_beaten = deque(maxlen=10)
-        
-        # State tracking
-        self.total_rounds = 0
-        self.current_streak = 0
-        self.prediction_confidence = 0.0
-        self.detected_behavior = "unknown"
-        self.last_prediction = None
-        self.last_prediction_strategy = None  # Track which strategy made the prediction
-        self.last_prediction_correct = None
+        # Move history (full lists for deep analysis)
+        self.opp_history: List[str] = []
+        self.my_history: List[str] = []
+        self.results: List[str] = []  # 'w' = AI win, 'l' = AI loss, 'd' = draw
         
         # Statistics
+        self.total_rounds = 0
         self.wins = 0
         self.losses = 0
         self.draws = 0
+        self.current_streak = 0
         
-        # Try to load previous learning
-        self.load_brain()
+        # State for UI
+        self.prediction_confidence = 0.0
+        self.last_prediction = None
+        self.last_prediction_strategy = None
+        self.last_prediction_correct = None
+        self.detected_behavior = "unknown"
+        self.active_strategy_name = "gathering data"
+        
+        # Build the strategy roster
+        self._build_strategies()
+        
+        # Track what each strategy WOULD have suggested (for scoring)
+        self._last_suggestions: Dict[str, Optional[str]] = {}
+        
+        # Anti-exploitation tracking
+        self._recent_my_moves = deque(maxlen=20)
+        self._exploitation_counter = 0
+        
+        # Nash equilibrium fallback tracking
+        self._nash_rounds = 0
+        self._nash_cooldown = 0
+        
+        # Load brain
+        if not reset_brain:
+            self.load_brain()
+    
+    def _build_strategies(self):
+        """Build the full roster of meta-strategies."""
+        base_predictors = [
+            FrequencyPredictor(),
+            RecentFrequencyPredictor(),
+            Markov1Predictor(),
+            Markov2Predictor(),
+            NgramPredictor(3),
+            NgramPredictor(4),
+            NgramPredictor(5),
+            NgramPredictor(6),
+            ContextPredictor(),
+            DoubleContextPredictor(),
+            WinStayLoseShiftPredictor(),
+            HistoryMatchPredictor(),
+            RotationPredictor(),
+            AntiMirrorPredictor(),
+            ResultContextPredictor(),
+            PairHistoryPredictor(),
+        ]
+        
+        self.strategies: List[MetaStrategy] = []
+        for predictor in base_predictors:
+            for meta_level in range(3):  # P0, P1, P2
+                self.strategies.append(MetaStrategy(predictor, meta_level))
     
     def get_move(self) -> str:
-        """Get AI's next move based on predictions.
+        """Get AI's next move. This is the main entry point."""
         
-        Returns:
-            The AI's chosen move ('rock', 'paper', or 'scissors')
-        """
-        # First 8 moves: pure random (gathering data)
-        if len(self.player_moves) < 8:
-            return random.choice(self.MOVES)
+        # Phase 1: Gathering data (first 5 rounds — play random)
+        if self.total_rounds < 5:
+            self.active_strategy_name = "gathering data"
+            self.prediction_confidence = 0.0
+            self.last_prediction = None
+            return random.choice(MOVES)
         
-        # Check if we're being exploited
-        if self._detect_exploitation():
-            # Being counter-played! Go random for unpredictability
-            return random.choice(self.MOVES)
+        # Phase 2: Check for Nash fallback
+        if self._should_play_nash():
+            self.active_strategy_name = "Nash equilibrium (shield)"
+            self.prediction_confidence = 0.0
+            self.last_prediction = None
+            self._nash_rounds += 1
+            return random.choice(MOVES)
         
-        # Get prediction of what player will do
-        prediction = self._predict_player_move()
-        
-        self.last_prediction = prediction['move']
-        self.last_prediction_strategy = prediction['strategy']  # Track strategy for performance analysis
-        self.prediction_confidence = prediction['confidence']
-        
-       # HOT-HAND DETECTION: Boost confidence when a strategy is working
-        best_strategy_name = self.strategy_performance.get_best_strategy()
-        if best_strategy_name and prediction['strategy'] == best_strategy_name:
-            strategy_accuracy = self.strategy_performance.get_strategy_accuracy(best_strategy_name)
-            
-            # Aggressive exploitation: if we're winning with this strategy, trust it more
-            if self.current_streak >= 3 and strategy_accuracy > 0.60:
-                # Hot hand! Boost confidence significantly
-                prediction['confidence'] *= 1.5
-                prediction['confidence'] = min(0.95, prediction['confidence'])
-        
-        # Check if our predictions are actually working
-        prediction_accuracy = self.prediction_tracker.get_accuracy()
-        should_trust = self.prediction_tracker.should_trust_predictions()
-        
-        # AGGRESSIVE confidence thresholds - trust predictions more
-        if should_trust and prediction_accuracy > 0.50:
-            # Our predictions are working very well - be very aggressive!
-            high_conf_threshold = 0.40
-            med_conf_threshold = 0.30
-        elif should_trust and prediction_accuracy > 0.42:
-            # Our predictions are working - be aggressive!
-            high_conf_threshold = 0.45
-            med_conf_threshold = 0.35
-        elif prediction_accuracy > 0.36:
-            # Marginal performance - still be somewhat aggressive
-            high_conf_threshold = 0.55
-            med_conf_threshold = 0.45
-        else:
-            # Predictions failing - use random
-            high_conf_threshold = 0.70
-            med_conf_threshold = 0.60
-        
-        # Decide move based on AGGRESSIVE confidence
-        if prediction['confidence'] >= high_conf_threshold:
-            # High confidence: counter the prediction AGGRESSIVELY
-            ai_move = self.BEATEN_BY[prediction['move']]
-            
-            # Only enforce diversity if confidence is not extremely high
-            if prediction['confidence'] < 0.75 and len(self.ai_moves) >= 5:
-                recent_ai = list(self.ai_moves)[-5:]
-                if recent_ai.count(ai_move) >= 4:  # Only if 4+ times
-                    # 30% chance to switch (less randomness)
-                    if random.random() < 0.3:
-                        other_moves = [m for m in self.MOVES if m != ai_move]
-                        ai_move = random.choice(other_moves)
-        
-        elif prediction['confidence'] >= med_conf_threshold:
-            # Medium confidence: weighted randomization (more aggressive)
-            counter_move = self.BEATEN_BY[prediction['move']]
-            
-            # 75% counter, 25% random
-            if random.random() < 0.75:
-                ai_move = counter_move
-            else:
-                ai_move = random.choice(self.MOVES)
-        
-        else:
-            # Low confidence: PURE Nash equilibrium (true random)
-            ai_move = random.choice(self.MOVES)
-        
-        return ai_move
-    
-    def record_round(self, player_move: str, ai_move: str) -> str:
-        """Record the result of a round.
-        
-        Args:
-            player_move: The player's move
-            ai_move: The AI's move
-            
-        Returns:
-            Result from AI's perspective: 'w' (win), 'l' (loss), or 'd' (draw)
-        """
-        result = self._determine_result(ai_move, player_move)
-        
-        # Track prediction accuracy (BEFORE updating history)
-        if self.last_prediction is not None and len(self.player_moves) > 0:
-            self.prediction_tracker.record(
-                self.last_prediction,
-                player_move,
-                self.prediction_confidence
+        # Phase 3: Get all strategy suggestions and pick the best
+        suggestions = {}
+        for strategy in self.strategies:
+            suggestion = strategy.get_suggestion(
+                self.opp_history, self.my_history, self.results
             )
-            # NEW: Track per-strategy performance
-            if self.last_prediction_strategy:
-                self.strategy_performance.record(
-                    self.last_prediction_strategy,
-                    self.last_prediction,
-                    player_move
-                )
-            self.last_prediction_correct = (self.last_prediction == player_move)
+            if suggestion is not None:
+                suggestions[strategy.name] = suggestion
+                self._last_suggestions[strategy.name] = suggestion
+        
+        if not suggestions:
+            self.active_strategy_name = "no patterns found"
+            self.prediction_confidence = 0.0
+            return random.choice(MOVES)
+        
+        # Find the best-scoring strategy that has a suggestion
+        best_strategy = None
+        best_score = -float('inf')
+        
+        for strategy in self.strategies:
+            if strategy.name in suggestions and strategy.score > best_score:
+                best_score = strategy.score
+                best_strategy = strategy
+        
+        if best_strategy is None or best_score < -2.0:
+            # All strategies are performing badly — Nash fallback
+            self.active_strategy_name = "Nash fallback (all negative)"
+            self.prediction_confidence = 0.0
+            return random.choice(MOVES)
+        
+        # Use the best strategy's suggestion
+        chosen_move = suggestions[best_strategy.name]
+        self.active_strategy_name = best_strategy.name
+        
+        # Calculate confidence based on strategy score
+        self.prediction_confidence = min(0.95, max(0.0, best_score / 5.0))
+        
+        # Get the prediction for display
+        opp_prediction = best_strategy.get_predicted_opp_move(
+            self.opp_history, self.my_history, self.results
+        )
+        self.last_prediction = opp_prediction
+        self.last_prediction_strategy = best_strategy.name
+        
+        # Anti-repetition: if we're playing the same move too often, inject randomness
+        self._recent_my_moves.append(chosen_move)
+        if len(self._recent_my_moves) >= 8:
+            move_counts = Counter(self._recent_my_moves)
+            most_common_count = move_counts.most_common(1)[0][1]
+            if most_common_count / len(self._recent_my_moves) > 0.65:
+                # We're being too predictable — 30% chance to randomize
+                if random.random() < 0.30:
+                    chosen_move = random.choice(MOVES)
+                    self.active_strategy_name += " (anti-repeat jitter)"
+        
+        return chosen_move
+    
+    def record_round(self, opponent_move: str, ai_move: str) -> str:
+        """Record the result of a round and update all strategies."""
+        result = self._determine_result(ai_move, opponent_move)
+        
+        # Score ALL strategies based on what they WOULD have done
+        for strategy in self.strategies:
+            suggestion = strategy.get_suggestion(
+                self.opp_history, self.my_history, self.results
+            )
+            if suggestion is not None:
+                # Would this strategy have won?
+                would_have_won = (BEATS[suggestion] == opponent_move)
+                would_have_drawn = (suggestion == opponent_move)
+                strategy.update_score(would_have_won, would_have_drawn)
         
         # Update history
-        self.player_moves.append(player_move)
-        self.ai_moves.append(ai_move)
+        self.opp_history.append(opponent_move)
+        self.my_history.append(ai_move)
         self.results.append(result)
         
-        # Update statistics
+        # Trim history if too long (keep last memory_size entries)
+        if len(self.opp_history) > self.memory_size:
+            excess = len(self.opp_history) - self.memory_size
+            self.opp_history = self.opp_history[excess:]
+            self.my_history = self.my_history[excess:]
+            self.results = self.results[excess:]
+        
+        # Update stats
         self.total_rounds += 1
         if result == 'w':
             self.wins += 1
@@ -312,391 +726,127 @@ class RPSPredictor:
         elif result == 'l':
             self.losses += 1
             self.current_streak = min(-1, self.current_streak - 1)
-            # Track if opponent beat our move
-            self.recent_ai_moves_beaten.append(ai_move)
         else:
             self.draws += 1
             self.current_streak = 0
         
-        # Learn patterns
-        self._learn_patterns(player_move)
-        self._learn_behaviors(player_move, result)
+        # Check prediction correctness
+        if self.last_prediction is not None:
+            self.last_prediction_correct = (self.last_prediction == opponent_move)
         
-        # Decay old patterns periodically
-        self._decay_old_patterns()
+        # Detect exploitation
+        self._check_exploitation(ai_move, opponent_move, result)
         
-        # Analyze opponent style
-        if self.total_rounds % 15 == 0:
-            self._analyze_opponent_style()
+        # Update behavior analysis periodically
+        if self.total_rounds % 10 == 0:
+            self._analyze_behavior()
         
         return result
     
-    def _predict_player_move(self) -> Dict[str, any]:
-        """Predict what the player will do next using ensemble of strategies.
-        
-        Returns:
-            Dict with 'move' (prediction) and 'confidence' (0.0-1.0)
-        """
-        predictions = []
-        
-        # Strategy 1: Sequence pattern detection (n-grams) - AGGRESSIVE with recency weighting
-        for length in [4, 3, 2]:
-            if len(self.player_moves) >= length + 2:
-                seq = tuple(list(self.player_moves)[-length:])
-                if seq in self.sequences and self.sequences[seq]:
-                    total = sum(self.sequences[seq].values())
-                    
-                    # AGGRESSIVE sample requirements - lower thresholds
-                    min_samples = {4: 2, 3: 3, 2: 4}[length]
-                    if total >= min_samples:
-                        most_common = self.sequences[seq].most_common(1)[0]
-                        move, count = most_common
-                        
-                        # Pattern strength-based confidence
-                        raw_conf = count / total
-                        # Lower threshold for pattern detection
-                        if raw_conf >= 0.40:  # 40% consistency is enough
-                            sample_bonus = min(1.0, total / (min_samples * 1.2))
-                            # Longer patterns get higher confidence
-                            length_bonus = {4: 0.95, 3: 0.90, 2: 0.85}[length]
-                            
-                            # RECENCY WEIGHTING: boost if pattern is working recently
-                            recency_bonus = 1.0
-                            if total > min_samples * 2 and len(self.player_moves) >= length + 5:
-                                # Check if pattern worked in last few occurrences
-                                recent_matches = 0
-                                for j in range(min(5, len(self.player_moves) - length)):
-                                    check_seq = tuple(list(self.player_moves)[-(length+1+j):-(1+j)])
-                                    if check_seq == seq and len(self.player_moves) > (1+j):
-                                        actual_next = self.player_moves[-(1+j)] if (1+j) <= len(self.player_moves) else None
-                                        if actual_next == move:
-                                            recent_matches += 1
-                                
-                                if recent_matches >= 2:
-                                    recency_bonus = 1.15  # 15% boost for recent consistency
-                            
-                            confidence = raw_conf * sample_bonus * length_bonus * recency_bonus
-                            predictions.append(('pattern', move, confidence, f'{length}-gram', total))
-        
-        # Strategy 2: Transition probability (MARKOV) - AGGRESSIVE
-        if len(self.player_moves) >= 4:
-            last_move = self.player_moves[-1]
-            if last_move in self.transitions and self.transitions[last_move]:
-                total = sum(self.transitions[last_move].values())
-                if total >= 3:  # Lower requirement
-                    most_common = self.transitions[last_move].most_common(1)[0]
-                    move, count = most_common
-                    
-                    raw_conf = count / total
-                    if raw_conf >= 0.40:
-                        sample_bonus = min(1.0, total / 8)
-                        confidence = raw_conf * sample_bonus * 0.85
-                        predictions.append(('transition', move, confidence, 'markov', total))
-        
-        # Strategy 3: Win-Stay / Lose-Shift Detection - COMPLETELY REWRITTEN
-        # This is the critical fix for the 39% win rate against Win-Stay opponents
-        if len(self.player_moves) >= 3 and len(self.results) >= 2:
-            total_after_wins = self.win_repeats + self.win_switches
-            total_after_losses = self.loss_repeats + self.loss_switches
-            
-            # Check for Win-Stay behavior (player repeats after winning)
-            if total_after_wins >= 3:  # Have enough data
-                repeat_rate_after_wins = self.win_repeats / total_after_wins
-                
-                # LOWERED threshold from 65% to 60% for earlier detection
-                if repeat_rate_after_wins >= 0.60:  # Strong Win-Stay detected
-                    last_result = self.results[-1]
-                    last_player_move = self.player_moves[-1]
-                    
-                    if last_result == 'l':  # AI lost, so opponent WON
-                        # Opponent will likely REPEAT their winning move
-                        # INCREASED confidence from 0.75 to 0.70-0.85 range
-                        base_conf = 0.70
-                        strength_bonus = min(0.15, (repeat_rate_after_wins - 0.60) * 0.375)
-                        sample_bonus = min(0.05, (total_after_wins - 3) * 0.01)
-                        confidence = base_conf + strength_bonus + sample_bonus
-                        
-                        predictions.append(('win-stay', last_player_move, confidence, 
-                                          f'repeats-{repeat_rate_after_wins:.0%}', total_after_wins))
-            
-            # Check for Lose-Shift behavior (player switches after losing)
-            if total_after_losses >= 3:  # Have enough data
-                switch_rate_after_losses = self.loss_switches / total_after_losses
-                
-                # LOWERED threshold from 65% to 60% for earlier detection
-                if switch_rate_after_losses >= 0.60:  # Strong Lose-Shift detected
-                    last_result = self.results[-1]
-                    last_player_move = self.player_moves[-1]
-                    
-                    if last_result == 'w':  # AI won, so opponent LOST
-                        # Opponent will likely SWITCH from their losing move
-                        other_moves = [m for m in self.MOVES if m != last_player_move]
-                        
-                        # IMPROVED: Higher confidence, split between two options
-                        base_conf = 0.50  # Increased from 0.42
-                        strength_bonus = min(0.10, (switch_rate_after_losses - 0.60) * 0.25)
-                        confidence = base_conf + strength_bonus
-                        
-                        # Add both possible switch targets
-                        for other_move in other_moves:
-                            predictions.append(('lose-shift', other_move, confidence, 
-                                              f'switches-{switch_rate_after_losses:.0%}', total_after_losses))
-
-        
-        # Strategy 4: Behavioral response - General outcome-based patterns
-        # Humans tend to avoid repeating the same move consecutively
-        if len(self.player_moves) >= 8:
-            # Count consecutive repeats in history
-            repeat_count = 0
-            for i in range(len(self.player_moves) - 1):
-                if self.player_moves[i] == self.player_moves[i+1]:
-                    repeat_count += 1
-            
-            repeat_rate = repeat_count / (len(self.player_moves) - 1)
-            
-            # If they rarely repeat (anti-repetition bias)
-            if repeat_rate < 0.25 and len(self.player_moves) >= 12:
-                last_move = self.player_moves[-1]
-                other_moves = [m for m in self.MOVES if m != last_move]
-                
-                # Calculate confidence based on how strongly they avoid repeating
-                base_conf = 0.35 + (0.25 - repeat_rate) * 0.8
-                split_conf = base_conf / 2  # Split between two possible moves
-                
-                # Add predictions for both non-repeating moves
-                for other_move in other_moves:
-                    predictions.append(('anti-repeat', other_move, split_conf, 'avoids-repetition', len(self.player_moves)))
-        
-        # Strategy 5: Frequency analysis - AGGRESSIVE
-        if self.move_preferences:
-            total = sum(self.move_preferences.values())
-            if total >= 10:  # Lower requirement
-                most_common = self.move_preferences.most_common(1)[0]
-                move, count = most_common
-                
-                raw_conf = count / total
-                if raw_conf >= 0.42:  # Lower threshold
-                    confidence = raw_conf * 0.75  # Higher max
-                    predictions.append(('frequency', move, confidence, 'preference', total))
-        
-        # ENSEMBLE VOTING - IMPROVED with strategy performance weighting
-        if predictions:
-            move_votes = defaultdict(lambda: {'weighted_conf': 0.0, 'count': 0, 'max_conf': 0.0, 'strategies': []})
-            
-            for strategy_type, move, conf, detail, samples in predictions:
-                # Apply strategy performance weight
-                strategy_weight = self.strategy_performance.get_strategy_weight(strategy_type)
-                weighted_conf = conf * strategy_weight
-                
-                # PRIORITY BOOST: Win-Stay and Lose-Shift predictions get extra weight
-                # These are behavioral patterns that deserve priority
-                if strategy_type in ['win-stay', 'lose-shift']:
-                    weighted_conf += 0.15  # Significant boost to compete with other strategies
-                
-                move_votes[move]['weighted_conf'] += weighted_conf
-                move_votes[move]['count'] += 1
-                move_votes[move]['max_conf'] = max(move_votes[move]['max_conf'], conf)
-                move_votes[move]['strategies'].append((strategy_type, conf, weighted_conf))
-            
-            # Score each move
-            best_move = None
-            best_score = 0
-            best_strategy = None
-            
-            for move, votes in move_votes.items():
-                # Use WEIGHTED confidence with agreement bonus
-                base_conf = votes['max_conf']
-                weighted_bonus = (votes['weighted_conf'] - base_conf) * 0.5  # Bonus from other weighted strategies
-                agreement_bonus = (votes['count'] - 1) * 0.10  # Agreement bonus
-                ensemble_score = base_conf + weighted_bonus + agreement_bonus
-                
-                if ensemble_score > best_score:
-                    best_score = ensemble_score
-                    best_move = move
-                    # Find the primary strategy (highest confidence)
-                    best_strategy = max(votes['strategies'], key=lambda x: x[1])[0]
-            
-            # Final confidence - HIGHER CAP
-            final_confidence = min(0.92, best_score)  # Allow up to 92%
-            
-            # Apply prediction accuracy calibration
-            accuracy = self.prediction_tracker.get_accuracy()
-            if accuracy < 0.40:
-                # Predictions failing - reduce confidence
-                final_confidence *= 0.7
-            
-            return {
-                'move': best_move,
-                'confidence': final_confidence,
-                'strategy': best_strategy,
-                'detail': ''
-            }
-        else:
-            # No patterns detected: random guess
-            return {
-                'move': random.choice(self.MOVES),
-                'confidence': 0.25,  # Very low confidence
-                'strategy': 'nash',
-                'detail': 'random'
-            }
-    
-    def _learn_patterns(self, player_move: str):
-        """Learn patterns from player's move history."""
-        self.move_preferences[player_move] += 1
-        
-        # Learn n-gram sequences (2-4 length)
-        for length in range(2, 5):
-            if len(self.player_moves) >= length:
-                seq = tuple(list(self.player_moves)[-(length+1):-1])
-                next_move = player_move
-                self.sequences[seq][next_move] += 1
-        
-        # Learn transition probabilities
-        if len(self.player_moves) >= 1:
-            prev_move = self.player_moves[-1]
-            self.transitions[prev_move][player_move] += 1
-    
-    def _learn_behaviors(self, player_move: str, result: str):
-        """Learn behavioral patterns (how player responds to outcomes)."""
-        if len(self.results) >= 2 and len(self.player_moves) >= 2:
-            # Look at the PREVIOUS result (before current move was made)
-            prev_result = self.results[-2]
-            prev_player_move = self.player_moves[-2]
-            current_player_move = player_move
-            
-            # Track general responses
-            if prev_result == 'w':
-                self.win_responses[current_player_move] += 1
-            elif prev_result == 'l':
-                self.loss_responses[current_player_move] += 1
-            else:
-                self.draw_responses[current_player_move] += 1
-            
-            # Track Win-Stay / Lose-Shift behavior
-            did_repeat = (current_player_move == prev_player_move)
-            
-            if prev_result == 'l':  # AI lost (player WON)
-                if did_repeat:
-                    self.win_repeats += 1  # Player repeated after winning
-                else:
-                    self.win_switches += 1  # Player switched after winning
-            
-            elif prev_result == 'w':  # AI won (player LOST)
-                if did_repeat:
-                    self.loss_repeats += 1  # Player repeated after losing
-                else:
-                    self.loss_switches += 1  # Player switched after losing
-    
-    def _decay_old_patterns(self):
-        """Decay old pattern weights to prioritize recent behavior."""
-        if self.total_rounds % 25 == 0 and self.total_rounds > 0:
-            # Reduce all pattern counts by 10% every 25 rounds
-            # This helps AI adapt when opponent changes strategy
-            for seq in list(self.sequences.keys()):
-                for move in list(self.sequences[seq].keys()):
-                    self.sequences[seq][move] = max(1, int(self.sequences[seq][move] * 0.9))
-            
-            for move_from in list(self.transitions.keys()):
-                for move_to in list(self.transitions[move_from].keys()):
-                    self.transitions[move_from][move_to] = max(1, int(self.transitions[move_from][move_to] * 0.9))
-    
-    def _detect_exploitation(self) -> bool:
-        """Detect if opponent is counter-playing AI's patterns."""
-        if len(self.ai_moves) < 15 or len(self.recent_ai_moves_beaten) < 8:
+    def _should_play_nash(self) -> bool:
+        """Determine if we should fall back to Nash equilibrium."""
+        if self.total_rounds < 15:
             return False
         
-        # Check if we're losing badly
-        if self.total_rounds >= 20:
-            win_rate = self.wins / self.total_rounds
-            if win_rate < 0.25:  # Less than 25% - being exploited
-                return True
-        
-        # Check if opponent is consistently beating our most common moves
-        recent_ai = list(self.ai_moves)[-15:]
-        ai_counter = Counter(recent_ai)
-        most_common_ai = ai_counter.most_common(1)[0][0]
-        
-        # Check if this move is being beaten consistently
-        beaten_moves = list(self.recent_ai_moves_beaten)
-        if beaten_moves.count(most_common_ai) >= 5:
+        # Cool down from forced Nash
+        if self._nash_cooldown > 0:
+            self._nash_cooldown -= 1
             return True
+        
+        # Check if any strategy is significantly beating random
+        best_score = max(s.score for s in self.strategies)
+        
+        if best_score < -1.0 and self.total_rounds >= 20:
+            # Nothing is working — go Nash for a few rounds
+            self._nash_cooldown = 3
+            return True
+        
+        # Check recent win rate
+        if self.total_rounds >= 20:
+            recent_results = self.results[-15:]
+            recent_wins = recent_results.count('w')
+            recent_losses = recent_results.count('l')
+            
+            if recent_losses > 0 and recent_wins / len(recent_results) < 0.20:
+                # Getting crushed — Nash reset
+                self._nash_cooldown = 5
+                # Also reset strategy scores to give everyone a fresh start
+                for s in self.strategies:
+                    s.score *= 0.3
+                return True
         
         return False
     
+    def _check_exploitation(self, ai_move: str, opp_move: str, result: str):
+        """Check if opponent is exploiting our patterns."""
+        if result == 'l':
+            self._exploitation_counter += 1
+        elif result == 'w':
+            self._exploitation_counter = max(0, self._exploitation_counter - 1)
+        
+        # If being heavily exploited, reset all strategy preferences
+        if self._exploitation_counter >= 6:
+            for s in self.strategies:
+                s.score *= 0.2
+            self._exploitation_counter = 0
+    
+    def _analyze_behavior(self):
+        """Classify opponent's playing style."""
+        if self.total_rounds < 10:
+            self.detected_behavior = "learning"
+            return
+        
+        entropy = self._calculate_entropy()
+        
+        # Check win rate
+        win_rate = self.wins / self.total_rounds if self.total_rounds > 0 else 0
+        
+        # Check best strategy type
+        best_strat = max(self.strategies, key=lambda s: s.score)
+        
+        if entropy > 0.95:
+            self.detected_behavior = "random / unpredictable"
+        elif 'winstay' in best_strat.name:
+            self.detected_behavior = "win-stay / lose-shift"
+        elif 'ngram' in best_strat.name or 'history_match' in best_strat.name:
+            self.detected_behavior = "pattern-based"
+        elif 'rotation' in best_strat.name:
+            self.detected_behavior = "cycling / rotating"
+        elif 'context' in best_strat.name or 'pair_history' in best_strat.name:
+            self.detected_behavior = "context-adaptive"
+        elif 'anti_mirror' in best_strat.name:
+            self.detected_behavior = "mirroring / counter-playing"
+        elif 'frequency' in best_strat.name:
+            self.detected_behavior = "frequency-biased"
+        elif 'markov' in best_strat.name:
+            self.detected_behavior = "sequential (Markov)"
+        elif win_rate < 0.30:
+            self.detected_behavior = "advanced adaptive AI"
+        else:
+            self.detected_behavior = "mixed"
+    
     def _calculate_entropy(self) -> float:
-        """Calculate entropy of opponent moves (measure of randomness)."""
-        if len(self.player_moves) < 10:
+        """Calculate Shannon entropy of recent opponent moves."""
+        if len(self.opp_history) < 10:
             return 1.0
         
-        recent = list(self.player_moves)[-20:]
+        recent = self.opp_history[-30:]
         total = len(recent)
-        
         entropy = 0.0
-        for move in self.MOVES:
+        
+        for move in MOVES:
             count = recent.count(move)
             if count > 0:
                 p = count / total
                 entropy -= p * math.log2(p)
         
-        # Normalize to 0-1 (max entropy for 3 options is log2(3) ≈ 1.585)
-        max_entropy = math.log2(3)
-        return entropy / max_entropy
-    
-    def _analyze_opponent_style(self):
-        """Analyze and classify opponent's playing style."""
-        if len(self.player_moves) < 15:
-            self.detected_behavior = "learning"
-            return
-        
-        # Calculate entropy (randomness)
-        entropy = self._calculate_entropy()
-        
-        # Check prediction accuracy
-        accuracy = self.prediction_tracker.get_accuracy()
-        
-        # Classify based on entropy and predictability
-        if entropy > 0.95:  # High entropy = random
-            self.detected_behavior = "random"
-        elif accuracy > 0.50:  # We can predict them well
-            # Check what type of pattern
-            recent_10 = list(self.player_moves)[-10:]
-            unique = len(set(recent_10))
-            
-            if unique <= 3:
-                self.detected_behavior = "repetitive"
-            else:
-                # Check for sequences
-                has_pattern = False
-                for seq_len in [2, 3, 4]:
-                    if len(self.player_moves) >= seq_len * 3:
-                        seq = tuple(list(self.player_moves)[-seq_len:])
-                        if seq in self.sequences and sum(self.sequences[seq].values()) >= 3:
-                            has_pattern = True
-                            break
-                
-                if has_pattern:
-                    self.detected_behavior = "pattern-based"
-                else:
-                    # Check win-stay behavior
-                    if sum(self.loss_responses.values()) >= 5:
-                        total = sum(self.loss_responses.values())
-                        most_common = self.loss_responses.most_common(1)[0][1]
-                        if most_common / total > 0.55:
-                            self.detected_behavior = "win-stay"
-                        else:
-                            self.detected_behavior = "frequency-biased"
-                    else:
-                        self.detected_behavior = "frequency-biased"
-        elif accuracy > 0.38:
-            self.detected_behavior = "somewhat-predictable"
-        else:
-            self.detected_behavior = "adaptive"
+        return entropy / math.log2(3)
     
     def _determine_result(self, ai_move: str, player_move: str) -> str:
-        """Determine the result of a round from AI's perspective."""
+        """Determine result from AI's perspective."""
         if ai_move == player_move:
             return 'd'
-        elif self.BEATS[ai_move] == player_move:
+        elif BEATS[ai_move] == player_move:
             return 'w'
         else:
             return 'l'
@@ -714,70 +864,91 @@ class RPSPredictor:
             'current_streak': self.current_streak,
             'detected_behavior': self.detected_behavior,
             'last_confidence': self.prediction_confidence,
-            'prediction_accuracy': self.prediction_tracker.get_accuracy() * 100,
-            'entropy': self._calculate_entropy()
+            'prediction_accuracy': self._get_prediction_accuracy() * 100,
+            'entropy': self._calculate_entropy(),
+            'active_strategy': self.active_strategy_name,
         }
     
+    def _get_prediction_accuracy(self) -> float:
+        """Calculate recent prediction accuracy."""
+        if self.total_rounds < 10:
+            return 0.33
+        
+        # Check strategy scores — positive scores mean beating random
+        positive_strategies = [s for s in self.strategies if s.score > 0]
+        if not positive_strategies:
+            return 0.33
+        
+        best = max(positive_strategies, key=lambda s: s.score)
+        # Convert score to an accuracy-like metric
+        return min(0.85, 0.33 + best.score / 20.0)
+    
     def get_insights(self) -> List[str]:
-        """Get human-readable insights about the player."""
+        """Get human-readable insights."""
         insights = []
         
-        # Prediction performance
-        accuracy = self.prediction_tracker.get_accuracy()
-        if self.total_rounds >= 15:
-            if accuracy > 0.45:
-                insights.append(f"AI predictions are working well ({accuracy*100:.0f}% accurate)")
-            elif accuracy > 0.35:
-                insights.append(f"AI predictions are marginal ({accuracy*100:.0f}% accurate)")
-            else:
-                insights.append(f"Opponent plays randomly ({accuracy*100:.0f}% prediction rate)")
+        if self.total_rounds < 5:
+            insights.append("Still gathering data...")
+            return insights
         
-        # Move preferences
-        if self.move_preferences and self.total_rounds >= 15:
-            total = sum(self.move_preferences.values())
-            for move in self.MOVES:
-                count = self.move_preferences.get(move, 0)
-                pct = count / total * 100
-                if pct >= 45:
-                    insights.append(f"You favor {move} ({pct:.0f}%)")
+        # Best performing strategy
+        best = max(self.strategies, key=lambda s: s.score)
+        if best.score > 1.0:
+            meta_desc = {0: "direct prediction", 1: "counter-counter", 2: "triple counter"}
+            level = meta_desc.get(best.meta_level, "")
+            insights.append(f"Best strategy: {best.predictor.name} ({level}, score: {best.score:.1f})")
         
-        # Behavioral patterns
-        if self.detected_behavior != "unknown":
-            behavior_descriptions = {
-                "pattern-based": "You follow predictable sequences",
-                "win-stay": "You repeat moves after winning",
-                "repetitive": "You tend to repeat the same move",
-                "random": "You play very randomly",
-                "adaptive": "You adapt and counter-play",
-                "learning": "Still learning your style...",
-                "frequency-biased": "You have move preferences",
-                "somewhat-predictable": "You're somewhat predictable"
-            }
-            desc = behavior_descriptions.get(self.detected_behavior, "")
-            if desc:
-                insights.append(desc)
+        # Win rate insight
+        win_rate = self.wins / self.total_rounds * 100 if self.total_rounds > 0 else 0
+        if win_rate > 45:
+            insights.append(f"AI is dominating ({win_rate:.0f}% win rate) 🔥")
+        elif win_rate > 36:
+            insights.append(f"AI has edge ({win_rate:.0f}% win rate)")
+        elif win_rate < 28:
+            insights.append(f"Opponent is tough ({win_rate:.0f}% win rate)")
         
         # Entropy
         entropy = self._calculate_entropy()
-        if self.total_rounds >= 15:
-            if entropy < 0.85:
-                insights.append(f"Your play has low randomness (entropy: {entropy:.2f})")
+        if entropy < 0.85:
+            insights.append(f"Opponent has low randomness (entropy: {entropy:.2f}) — exploitable!")
+        elif entropy > 0.96:
+            insights.append(f"Opponent plays very randomly (entropy: {entropy:.2f})")
+        
+        # Behavior
+        if self.detected_behavior not in ("unknown", "learning"):
+            insights.append(f"Detected style: {self.detected_behavior}")
+        
+        # Strategy competition info
+        active_count = sum(1 for s in self.strategies if s.score > 0)
+        insights.append(f"{active_count}/{len(self.strategies)} strategies performing above baseline")
         
         return insights
     
+    def get_strategy_leaderboard(self, top_n: int = 5) -> List[Dict]:
+        """Get the top performing strategies."""
+        sorted_strategies = sorted(self.strategies, key=lambda s: s.score, reverse=True)
+        leaderboard = []
+        for s in sorted_strategies[:top_n]:
+            leaderboard.append({
+                'name': s.name,
+                'score': s.score,
+                'predictor': s.predictor.name,
+                'meta_level': s.meta_level,
+            })
+        return leaderboard
+    
     def save_brain(self):
-        """Save learned patterns to disk for persistence."""
+        """Save learned state to disk."""
         brain_data = {
-            'sequences': dict(self.sequences),
-            'transitions': dict(self.transitions),
-            'win_responses': dict(self.win_responses),
-            'loss_responses': dict(self.loss_responses),
-            'draw_responses': dict(self.draw_responses),
-            'move_preferences': dict(self.move_preferences),
+            'version': '4.0',
+            'opp_history': self.opp_history[-100:],  # Save last 100 moves
+            'my_history': self.my_history[-100:],
+            'results': self.results[-100:],
             'total_rounds': self.total_rounds,
             'wins': self.wins,
             'losses': self.losses,
-            'draws': self.draws
+            'draws': self.draws,
+            'strategy_scores': {s.name: s.score for s in self.strategies},
         }
         
         try:
@@ -789,7 +960,7 @@ class RPSPredictor:
             return False
     
     def load_brain(self):
-        """Load previously learned patterns from disk."""
+        """Load previously learned state from disk."""
         if not os.path.exists(self.save_file):
             return False
         
@@ -797,77 +968,54 @@ class RPSPredictor:
             with open(self.save_file, 'rb') as f:
                 brain_data = pickle.load(f)
             
-            # Load learned patterns
-            self.sequences = defaultdict(Counter, brain_data.get('sequences', {}))
-            self.transitions = defaultdict(Counter, brain_data.get('transitions', {}))
-            self.win_responses = Counter(brain_data.get('win_responses', {}))
-            self.loss_responses = Counter(brain_data.get('loss_responses', {}))
-            self.draw_responses = Counter(brain_data.get('draw_responses', {}))
-            self.move_preferences = Counter(brain_data.get('move_preferences', {}))
+            # Only load v4.0 brains
+            if brain_data.get('version') != '4.0':
+                print("🧠 Old brain format detected — starting fresh with v4.0 engine.")
+                return False
             
-            # Load lifetime stats (but reset current game stats)
-            saved_rounds = brain_data.get('total_rounds', 0)
-            if saved_rounds > 0:
-                print(f"\n🧠 AI Brain loaded! Previously learned from {saved_rounds} rounds.")
-                print(f"   Lifetime stats: {brain_data.get('wins', 0)}-{brain_data.get('losses', 0)}-{brain_data.get('draws', 0)}")
+            self.opp_history = brain_data.get('opp_history', [])
+            self.my_history = brain_data.get('my_history', [])
+            self.results = brain_data.get('results', [])
+            self.total_rounds = brain_data.get('total_rounds', 0)
+            self.wins = brain_data.get('wins', 0)
+            self.losses = brain_data.get('losses', 0)
+            self.draws = brain_data.get('draws', 0)
+            
+            # Restore strategy scores
+            saved_scores = brain_data.get('strategy_scores', {})
+            for strategy in self.strategies:
+                if strategy.name in saved_scores:
+                    strategy.score = saved_scores[strategy.name]
+            
+            if self.total_rounds > 0:
+                print(f"\n🧠 Beast AI brain loaded! Previously learned from {self.total_rounds} rounds.")
+                print(f"   Lifetime stats: {self.wins}-{self.losses}-{self.draws}")
+                best = max(self.strategies, key=lambda s: s.score)
+                if best.score > 0:
+                    print(f"   Best strategy: {best.name} (score: {best.score:.1f})")
             
             return True
         except Exception as e:
             print(f"Warning: Could not load brain: {e}")
             return False
     
-    def reset_brain(self):
-        """Reset all learned patterns (forget everything)."""
-        self.sequences = defaultdict(Counter)
-        self.transitions = defaultdict(Counter)
-        self.win_responses = Counter()
-        self.loss_responses = Counter()
-        self.draw_responses = Counter()
-        self.move_preferences = Counter()
+    def reset(self):
+        """Full reset — forget everything."""
+        self.opp_history.clear()
+        self.my_history.clear()
+        self.results.clear()
+        self.total_rounds = 0
         self.wins = 0
         self.losses = 0
         self.draws = 0
-        self.total_rounds = 0
+        self.current_streak = 0
+        self._exploitation_counter = 0
+        self._nash_rounds = 0
+        self._nash_cooldown = 0
+        self._recent_my_moves.clear()
         
-        # Delete save file
-        if os.path.exists(self.save_file):
-            os.remove(self.save_file)
-            print("🧠 AI brain reset! Starting fresh.")
-
-
-# Quick test
-if __name__ == "__main__":
-    print("🎯 RPS Predictor v2.0 - Quick Test")
-    print("=" * 50)
-    
-    ai = RPSPredictor()
-    
-    # Test 1: Pattern
-    print("\n[TEST 1] Pattern: rock → paper → scissors → ...")
-    pattern = ['rock', 'paper', 'scissors'] * 10
-    
-    for i, player_move in enumerate(pattern):
-        ai_move = ai.get_move()
-        result = ai.record_round(player_move, ai_move)
+        for strategy in self.strategies:
+            strategy.reset_score()
+            strategy.predictor.reset()
         
-        if i >= 5 and i % 5 == 0:
-            result_text = {"w": "WIN", "l": "LOSS", "d": "DRAW"}[result]
-            print(f"  Round {i+1}: {result_text} (conf: {ai.prediction_confidence:.0%}, acc: {ai.prediction_tracker.get_accuracy()*100:.0f}%)")
-    
-    stats = ai.get_stats()
-    print(f"\n  Final: {stats['win_rate']:.1f}% win rate, {stats['prediction_accuracy']:.0f}% prediction accuracy")
-    
-    # Test 2: Random
-    print("\n[TEST 2] Random opponent")
-    ai2 = RPSPredictor()
-    random.seed(42)
-    
-    for i in range(30):
-        player_move = random.choice(ai2.MOVES)
-        ai_move = ai2.get_move()
-        result = ai2.record_round(player_move, ai_move)
-    
-    stats2 = ai2.get_stats()
-    print(f"  Final: {stats2['win_rate']:.1f}% win rate (should be ~33%)")
-    print(f"  Detection: {stats2['detected_behavior']}")
-    print(f"  Entropy: {stats2['entropy']:.2f}")
+        print("🧠 Beast AI brain reset — all knowledge forgotten!")
