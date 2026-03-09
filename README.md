@@ -2,6 +2,9 @@
 
 An advanced Rock Paper Scissors AI that learns your patterns and predicts your moves.
 
+## KEEP IN MIND
+> This is not a get rich quick method, although I wish it was. That was the whole reason why I started this project. The results have impressed me, more often than not I have won and won big at times. This is not bullet proof. Whatever stake has got is a beast and will evolve and adapt quickly. Once it does, this AI will do the same. That is when you will win, you will lose once stake's AI adapts. It is a cat and mouse type thing. Bet when you are the cat, use gold coins when you are the mouse.
+
 ## 🎯 Features
 
 - **Fast Pattern Recognition** - Detects sequences in just 5-10 rounds
