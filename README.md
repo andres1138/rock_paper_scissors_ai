@@ -1,165 +1,112 @@
-# Rock Paper Scissors - Prediction AI
+# Rock Paper Scissors — Beast AI Coach
 
-An advanced Rock Paper Scissors AI that learns your patterns and predicts your moves.
+A terminal-based Rock Paper Scissors coach that watches your opponent's patterns and tells you what to play. You feed it results, it figures out what your opponent is doing, and it gets better over time.
 
-## KEEP IN MIND
-> This is not a get rich quick method, although I wish it was. That was the whole reason why I started this project. The results have impressed me, more often than not I have won and won big at times. This is not bullet proof. Whatever stake has got is a beast and will evolve and adapt quickly. Once it does, this AI will do the same. That is when you will win, you will lose once stake's AI adapts. It is a cat and mouse type thing. Bet when you are the cat, use gold coins when you are the mouse.
+> **Heads up** — this started as an attempt to beat Stake's RPS. Honestly, it works more often than I expected. That said, it's not a money printer — Stake's AI adapts, and when it does you'll start losing. Then this AI adapts back. It's a cat and mouse thing. Win when you're the cat, and stick to gold coins when you're the mouse.
 
-## 🎯 Features
+---
 
-- **Fast Pattern Recognition** - Detects sequences in just 5-10 rounds
-- **Behavioral Analysis** - Understands human psychology (win-stay/lose-shift, anti-repetition bias)
-- **Confidence-Based Predictions** - Only acts on high-confidence predictions
-- **Smart Fallback** - Uses Nash equilibrium (random) when uncertain
-- **No Repetition** - AI avoids spamming the same move
-- **Real-time Insights** - See what patterns the AI detects in your play
+## What it does
 
-## 🚀 Quick Start
+- Runs **48 strategies in parallel** — they all compete, and the best-performing one calls the shots at any given moment
+- Picks up on patterns fast — usually within **5–10 rounds**
+- Saves its brain between sessions so it picks up where it left off
+- Shows you its **confidence level** with every suggestion (green dot = high, yellow = medium)
+- Falls back to randomness when it's unsure, so it doesn't get exploited
+- Tracks lifetime stats across all your sessions
 
-### Get Move Suggestions (Coaching Mode)
+---
 
-The AI learns your opponent's patterns and tells you what to play:
+## Screenshots
+
+**Starting the game — the AI loads its saved brain and jumps straight in:**
+
+![Start screen](start_game_screenshot.png)
+
+**Mid-session — the AI coaching you round by round with confidence indicators:**
+
+![Game in progress](game_screenshot.png)
+
+---
+
+## Getting started
 
 ```bash
 python3 play_rps.py
 ```
 
-**How it works:**
-1. AI suggests a move for you (e.g., "Play ROCK")
-2. You play that move against your opponent
-3. You tell the AI if you won, lost, or drew (`w`/`l`/`d`)
-4. AI learns and gets smarter!
+That's it. The AI will greet you, load any previously saved session data, and start suggesting moves right away.
 
-For verbose mode (see AI's predictions about your opponent):
+For extra output showing what strategies are doing what internally:
 ```bash
 python3 play_rps.py --verbose
 ```
 
-### Run Tests
+---
 
-Test the AI against different strategies:
+## How a session goes
 
-```bash
-# Test against all strategies
-python3 test_ai.py --strategy all --rounds 100
+1. The AI tells you what to play — e.g. `🤖 Play: ROCK [🟢 HIGH]`
+2. You play that against your opponent
+3. You type `w`, `l`, or `d` depending on what happened
+4. Repeat — the AI keeps learning and adjusting
 
-# Test against specific strategy
-python3 test_ai.py --strategy pattern --rounds 50
+**Available commands during play:**
 
-# Available strategies: random, pattern, frequency, win-stay, counter
-```
-
-## 📊 Performance
-
-Tested over 100 rounds against different opponent types:
-
-| Opponent Strategy | AI Win Rate | Description |
-|------------------|-------------|-------------|
-| **Pattern-based** | **93%** 🔥 | Repeating sequences (R-P-S-S-P) |
-| **Frequency bias** | **73%** 🎯 | Favors rock 60% of the time |
-| **Counter-AI** | **61%** ✅ | Tries to counter AI's patterns |
-| **Random** | **38%** ⚖️ | Completely random (expected ~33%) |
-| **Win-Stay** | **38%** ⚖️ | Repeats after winning, shifts after losing |
-
-## 🧠 How It Works
-
-The AI uses multiple prediction strategies ranked by confidence:
-
-### 1. Pattern Detection (Primary)
-- **N-gram sequences** - Detects patterns of length 2-4
-- **Transition analysis** - What move follows what
-- **Cycle detection** - Repeating sequences
-
-### 2. Behavioral Modeling (Secondary)
-- **Win-stay/Lose-shift** - How you respond to outcomes
-- **Anti-repetition bias** - Humans avoid playing the same move repeatedly
-- **Frequency analysis** - Which moves you favor
-
-### 3. Nash Equilibrium (Fallback)
-- Pure random when confidence < 40%
-- Prevents exploitation
-
-## 🎮 Example Session
-
-```
-Round 5
-🤖 AI suggests you play: ROCK
-
-What happened? (w=won / l=lost / d=draw): w
-✅ YOU WIN! (Opponent played scissors)
-🎯 AI predicted correctly!
-
-Pattern detected: Opponent favors scissors after losing
-Streak: You winning 3 in a row! 🔥
-
-Score: You 9 | Losses 5 | Draws 1
-```
-
-## 📁 Files
-
-- **`rps_predictor.py`** - Core AI engine (~400 lines)
-- **`play_rps.py`** - AI Coach interface (suggests moves for you)
-- **`test_ai.py`** - Test suite with multiple opponent strategies
-
-## 🔧 Architecture
-
-```python
-class RPSPredictor:
-    # Pattern Recognition
-    - sequences: N-gram pattern storage
-    - transitions: Markov chain probabilities
-    
-    # Behavioral Analysis
-    - win_responses: How you react after winning
-    - loss_responses: How you react after losing
-    - move_preferences: Overall frequency bias
-    
-    # Prediction System
-    - _predict_player_move(): Multi-strategy prediction
-    - confidence scoring and voting
-```
-
-## 🆚 vs Previous Versions
-
-### Why This is Better
-
-| Old AI (rps_smart.py) | New AI (rps_predictor.py) |
-|----------------------|---------------------------|
-| 11+ complex strategies | 5 focused strategies |
-| Reactive (learns after losing) | **Predictive** (predicts before you move) |
-| 549 lines of complexity | 400 lines, clean and focused |
-| Repeats same move | Smart anti-repetition |
-| 50+ rounds to learn | **5-10 rounds to learn** |
-| No confidence scoring | Confidence-based decisions |
-
-### Test Comparison
-
-Against pattern-based opponent (R-P-S-S-P, 100 rounds):
-
-- **Old AI**: ~45-55% win rate
-- **New AI**: **93% win rate** ✨
-
-## 🎓 Tips for Using the AI Coach
-
-1. **Follow the AI's suggestions** - The AI is learning your opponent's patterns
-2. **Report accurately** - Tell the AI the real result (won/lost/drew)
-3. **Watch the insights** - The AI tells you what patterns it detected in your opponent
-4. **Give it time** - AI needs 5-10 rounds to learn patterns
-5. **Use verbose mode** - See the AI's predictions and confidence levels
-6. **Opponent changing strategy?** - The AI will adapt as it sees new patterns
-
-## 🤝 Contributing
-
-The AI is designed to be simple and extensible. Key areas for improvement:
-
-- Add more behavioral patterns (e.g., streak-based responses)
-- Implement meta-learning (learning which strategies work best)
-- Add persistent state saving (currently stateless)
-
-## 📝 License
-
-MIT License - Feel free to use and modify!
+| Command | What it does |
+|---------|--------------|
+| `w` | You won that round |
+| `l` | You lost that round |
+| `d` | Draw |
+| `stats` | Show win/loss breakdown |
+| `board` | Show the strategy leaderboard |
+| `undo` | Undo the last round |
+| `quit` | Exit |
 
 ---
 
-Built with ❤️ using pattern recognition and behavioral analysis. No machine learning libraries required!
+## Performance (100 rounds each)
+
+| Opponent type | Win rate | Notes |
+|--------------|----------|-------|
+| Pattern-based | **93%** | Rigid sequences like R-P-S-S-P |
+| Frequency bias | **73%** | Opponents that heavily favor one move |
+| Counter-AI | **61%** | Opponents actively trying to counter you |
+| Win-Stay/Lose-Shift | **38%** | Adapts after each round |
+| Random | **38%** | Expected is ~33%, so a slight edge |
+
+---
+
+## How it actually works
+
+Under the hood there are 48 prediction strategies running at the same time — things like n-gram pattern matching, Markov chain transition tracking, win-stay/lose-shift detection, anti-repetition bias modeling, and frequency analysis. Each strategy gets a score based on how well it's been predicting recently, and a weighted vote determines what move gets suggested.
+
+When no strategy is confident enough, it falls back to random (Nash equilibrium) so the AI doesn't develop predictable habits of its own.
+
+The brain is saved to `rps_ai_brain.pkl` after every round, so your session data carries over next time.
+
+---
+
+## Files
+
+- `rps_predictor.py` — the core AI engine, where all 48 strategies live
+- `play_rps.py` — the coaching interface you actually run
+- `test_ai.py` — test suite for running the AI against simulated opponents
+
+---
+
+## Running tests
+
+```bash
+# Run against all opponent types
+python3 test_ai.py --strategy all --rounds 100
+
+# Run against a specific opponent type
+python3 test_ai.py --strategy pattern --rounds 50
+```
+
+Available strategies: `random`, `pattern`, `frequency`, `win-stay`, `counter`
+
+---
+
+No ML libraries needed — just Python.
