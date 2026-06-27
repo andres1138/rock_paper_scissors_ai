@@ -2,7 +2,7 @@
 
 A terminal-based Rock Paper Scissors coach that watches your opponent's patterns and tells you what to play. You feed it results, it figures out what your opponent is doing, and it gets better over time.
 
-> **Heads up** — this started as an attempt to beat Stake's RPS. Honestly, it works more often than I expected. That said, it's not a money printer — Stake's AI adapts, and when it does you'll start losing. Then this AI adapts back. It's a cat and mouse thing. Win when you're the cat, and stick to gold coins when you're the mouse.
+> **Heads up** — this started as an attempt to beat Stake's RPS. Honestly, it works more often than I expected. That said, it's not a money printer — Stake's RPS does not react to your choices, even though it seems that way. It is completely random and this AI fights back slightly. It's a cat and mouse thing. Win when you're the cat, and stick to gold coins when you're the mouse.
 
 ---
 
